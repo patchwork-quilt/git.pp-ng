@@ -183,7 +183,7 @@ jobs:
     permissions:
       contents: read
     env:
-      EXPECTED_WORKER_DELTA: '50'
+      EXPECTED_WORKER_DELTA: '999'  # NEGATIVE CONTROL: deliberately above the 50 measured
       EXPECTED_FORMAT_V2: '26'
       EXPECTED_SECURITY_PROBES: '24'
 
