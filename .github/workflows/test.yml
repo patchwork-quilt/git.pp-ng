@@ -42,6 +42,9 @@ jobs:
   conformance:
     name: conformance harness (python + node differential)
     runs-on: ubuntu-latest
+    # Measured 9m40s on a 2-core sandbox running other work concurrently
+    # (wall/user ratio 4.5x, i.e. contention, not compute) and 29s on a clean
+    # GitHub runner -- same totals either way. 45 is headroom, not a measurement.
     timeout-minutes: 45
 
     # Node floor is DERIVED, not guessed: the repo declares no `engines` and
@@ -61,7 +64,11 @@ jobs:
       #
       #   $ git clone https://github.com/patchwork-quilt/git.pp-ng && cd git.pp-ng
       #   $ npm test          # -> cd conformance && python3 harness.py
-      #   real 9m39.789s, exit 0
+      #   real 9m39.789s, exit 0   (2-core sandbox, contended: 2m08s of user
+      #                             time against 9m40s of wall clock. On a clean
+      #                             GitHub runner the same run takes 29s and
+      #                             prints identical totals -- see run
+      #                             39107407021.)
       #
       # These are the numbers the harness printed on that run:
       #   CONFORMANCE: 863/863 cases identical (...)
