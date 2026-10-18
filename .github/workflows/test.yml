@@ -1,0 +1,322 @@
+# CI for git.pp-ng.
+#
+# This repository had NO .github/ directory at all until this file, which
+# means nothing has ever run its tests automatically. Everything asserted
+# below was MEASURED first, on a clean clone, and the measurement is
+# recorded next to each constant.
+#
+# THE POINT OF THIS FILE IS THE ASSERTIONS, NOT THE RUNNING.
+# A workflow that runs a suite and exits 0 because the suite printed
+# nothing is worse than no workflow: it converts "we don't know" into
+# "it's green". Every step below therefore (a) requires its results line
+# to EXIST, and (b) requires the count in it to be at least the number
+# measured here. Both failures are hard failures.
+#
+# There is deliberately NO publish and NO release step. This repository is
+# `"private": true` and is deployed through Cloudflare's API by a separate
+# documented procedure (see wrangler.toml and DEPLOY.md). Test CI must not
+# be able to deploy anything.
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Minimum. This workflow only reads the repo and runs tests. It needs no
+# write access to anything, no package write, no id-token, no deploy.
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. The differential + scale conformance harness. This is `npm test`.
+  #    MEASURED: 9m40s wall, so the job timeout is 3x that, not 1x.
+  # ---------------------------------------------------------------------------
+  conformance:
+    name: conformance harness (python + node differential)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # Node floor is DERIVED, not guessed: the repo declares no `engines` and
+    # has no .nvmrc, but conformance/harness.py runs `node conformance/runner.ts`
+    # with NO flags, and runner.ts imports "../src/fold.ts". That only works if
+    # Node's TypeScript type stripping is on by default, which is Node >= 22.18.0
+    # (and >= 23.6.0 on the odd-numbered line) per the Node.js TypeScript docs.
+    # Verified green on v22.19.0. 22 is the lowest LTS line that satisfies it.
+    # The step below asserts this precondition rather than trusting the pin.
+    env:
+      NODE_MAJOR_PIN: '22'
+      NODE_MIN: '22.18.0'
+
+      # ---------------------------------------------------------------------
+      # BASELINE, measured 2026-10-18 on a clean clone of main @ a680d7e,
+      # on node v22.19.0 / npm 10.9.3 / python 3.11.2 (linux x64).
+      #
+      #   $ git clone https://github.com/patchwork-quilt/git.pp-ng && cd git.pp-ng
+      #   $ npm test          # -> cd conformance && python3 harness.py
+      #   real 9m39.789s, exit 0
+      #
+      # These are the numbers the harness printed on that run:
+      #   CONFORMANCE: 863/863 cases identical (...)
+      #   FRONTIER:     16/16  cases identical (...)
+      #   FORMAT-V2:    19/19  cases identical (...)
+      #
+      # A count below any of these means the suite shrank, was truncated, or
+      # silently stopped running. That is a failure, not a pass.
+      # ---------------------------------------------------------------------
+      EXPECTED_CONFORMANCE_CASES: '863'
+      EXPECTED_FRONTIER_CASES: '16'
+      EXPECTED_FORMATV2_CASES: '19'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert the toolchain actually satisfies what this suite needs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -v
+          python3 --version
+          # Fail loudly if the pinned Node is older than the type-stripping floor.
+          node -e '
+            const [maj,min,pat]=process.versions.node.split(".").map(Number);
+            const req=process.env.NODE_MIN.split(".").map(Number);
+            const ok = maj>req[0] || (maj===req[0] && (min>req[1] || (min===req[1] && pat>=req[2])));
+            if(!ok){ console.error(`node ${process.versions.node} < required ${process.env.NODE_MIN}: ` +
+              "`node conformance/runner.ts` would not strip TypeScript without flags"); process.exit(1); }
+            console.log(`node ${process.versions.node} >= ${process.env.NODE_MIN}: type stripping available by default`);
+          '
+          command -v python3 >/dev/null || { echo "::error::python3 not found; the suite is a python harness"; exit 1; }
+
+      - name: setup node ${{ env.NODE_MAJOR_PIN }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_MAJOR_PIN }}
+          # NO `cache:` option, on purpose.
+          # Verified: package.json declares zero dependencies, there is no
+          # package-lock.json, and there is no node_modules/. There is nothing
+          # to restore. An unverifiable cache path would be decoration; the
+          # suite runs entirely on the python stdlib and node builtins.
+
+      - name: Run the harness exactly as the repository documents it
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The documented entry point. Do not reimplement it.
+          npm test 2>&1 | tee conformance-output.txt
+
+      - name: Assert what was measured
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG=conformance-output.txt
+          fail=0
+
+          assert_conformance() {
+            local re='^CONFORMANCE: ([0-9]+)/([0-9]+) cases identical'
+            local line; line="$(grep -E "$re" "$LOG" | head -1 || true)"
+            if [ -z "$line" ]; then
+              echo "::error::CONFORMANCE: no 'CONFORMANCE: N/N cases identical' line. The suite did not report; refusing to report green."
+              tail -40 "$LOG"; fail=1; return
+            fi
+            local got want
+            got="$(printf '%s' "$line"  | sed -E 's/^CONFORMANCE: ([0-9]+)\/.*/\1/')"
+            want="$(printf '%s' "$line" | sed -E 's/^CONFORMANCE: [0-9]+\/([0-9]+) .*/\1/')"
+            echo "CONFORMANCE: $got/$want cases identical (baseline >= $EXPECTED_CONFORMANCE_CASES)"
+            [ "$want" = "$got" ] || { echo "::error::CONFORMANCE: $got/$want is not a clean sweep."; fail=1; }
+            [ "$got" -ge "$EXPECTED_CONFORMANCE_CASES" ] || { echo "::error::CONFORMANCE reported $got cases, below measured baseline $EXPECTED_CONFORMANCE_CASES."; fail=1; }
+          }
+
+          assert_family() {
+            local label="$1" expected="$2" prefix="$3"
+            local re="^${prefix}: ([0-9]+)/([0-9]+) cases identical"
+            local line; line="$(grep -E "$re" "$LOG" | head -1 || true)"
+            if [ -z "$line" ]; then
+              echo "::error::$label: no '$prefix: N/N cases identical' line. Refusing to report green."
+              tail -40 "$LOG"; fail=1; return
+            fi
+            local got want
+            got="$(printf '%s' "$line"  | sed -E "s/^${prefix}: ([0-9]+)\/.*/\1/")"
+            want="$(printf '%s' "$line" | sed -E "s/^${prefix}: [0-9]+\/([0-9]+) .*/\1/")"
+            echo "$label: $got/$want cases identical (baseline >= $expected)"
+            [ "$want" = "$got" ] || { echo "::error::$label: $got/$want is not a clean sweep."; fail=1; }
+            [ "$got" -ge "$expected" ] || { echo "::error::$label reported $got cases, below measured baseline $expected."; fail=1; }
+          }
+
+          assert_conformance
+          assert_family FRONTIER  "$EXPECTED_FRONTIER_CASES"  "FRONTIER"
+          assert_family FORMAT-V2 "$EXPECTED_FORMATV2_CASES" "FORMAT-V2"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::conformance harness did not meet the measured baseline."
+            exit 1
+          fi
+          echo "conformance harness meets the measured baseline."
+
+  # ---------------------------------------------------------------------------
+  # 2. The offline .mjs suites. No network, no deployment, no mocking of the
+  #    network boundary -- these mock the Artifacts binding in memory and run
+  #    the real Worker module.
+  #    MEASURED 2026-10-18, node v22.19.0, same clean clone, exit 0:
+  #      node tests/worker-delta.mjs    -> "50 passed, 0 failed"
+  #      node tests/format-v2.mjs       -> "26 passed, 0 failed"
+  #      node tests/security-probes.mjs -> "ALL PROBES PASS", 24 PASS lines
+  # ---------------------------------------------------------------------------
+  offline-suites:
+    name: offline node suites (worker-delta, format-v2, security-probes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      EXPECTED_WORKER_DELTA: '50'
+      EXPECTED_FORMAT_V2: '26'
+      EXPECTED_SECURITY_PROBES: '24'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          # No cache: zero dependencies, no lockfile. Verified in the repo.
+
+      - name: worker-delta.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/worker-delta.mjs 2>&1 | tee worker-delta.txt
+
+      - name: assert worker-delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -Eq '^[0-9]+ passed, [0-9]+ failed' worker-delta.txt; then
+            echo "::error::worker-delta.mjs produced no '<n> passed, <n> failed' summary. Refusing to report green."
+            tail -30 worker-delta.txt; exit 1
+          fi
+          got="$(sed -nE 's/^([0-9]+) passed.*/\1/p' worker-delta.txt | head -1)"
+          bad="$(sed -nE 's/^[0-9]+ passed, ([0-9]+) failed.*/\1/p' worker-delta.txt | head -1)"
+          echo "worker-delta: $got passed, $bad failed (baseline >= $EXPECTED_WORKER_DELTA)"
+          [ "$bad" -eq 0 ] || { echo "::error::worker-delta.mjs reported $bad failures."; exit 1; }
+          [ "$got" -ge "$EXPECTED_WORKER_DELTA" ] || { echo "::error::worker-delta.mjs reported only $got passing assertions, below measured baseline $EXPECTED_WORKER_DELTA."; exit 1; }
+
+      - name: format-v2.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/format-v2.mjs 2>&1 | tee format-v2.txt
+
+      - name: assert format-v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -Eq '^[0-9]+ passed, [0-9]+ failed' format-v2.txt; then
+            echo "::error::format-v2.mjs produced no '<n> passed, <n> failed' summary. Refusing to report green."
+            tail -30 format-v2.txt; exit 1
+          fi
+          got="$(sed -nE 's/^([0-9]+) passed.*/\1/p' format-v2.txt | head -1)"
+          bad="$(sed -nE 's/^[0-9]+ passed, ([0-9]+) failed.*/\1/p' format-v2.txt | head -1)"
+          echo "format-v2: $got passed, $bad failed (baseline >= $EXPECTED_FORMAT_V2)"
+          [ "$bad" -eq 0 ] || { echo "::error::format-v2.mjs reported $bad failures."; exit 1; }
+          [ "$got" -ge "$EXPECTED_FORMAT_V2" ] || { echo "::error::format-v2.mjs reported only $got passing assertions, below measured baseline $EXPECTED_FORMAT_V2."; exit 1; }
+
+      - name: security-probes.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/security-probes.mjs 2>&1 | tee security-probes.txt
+
+      - name: assert security-probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -q 'ALL PROBES PASS' security-probes.txt; then
+            echo "::error::security-probes.mjs did not print ALL PROBES PASS. Refusing to report green."
+            tail -30 security-probes.txt; exit 1
+          fi
+          got="$(grep -c '^PASS' security-probes.txt || true)"
+          bad="$(grep -c '^FAIL' security-probes.txt || true)"
+          echo "security-probes: $got PASS lines, $bad FAIL lines (baseline >= $EXPECTED_SECURITY_PROBES)"
+          [ "$bad" -eq 0 ] || { echo "::error::security-probes.mjs reported $bad failing probes."; exit 1; }
+          [ "$got" -ge "$EXPECTED_SECURITY_PROBES" ] || { echo "::error::security-probes.mjs reported only $got passing probes, below measured baseline $EXPECTED_SECURITY_PROBES."; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # 3. tests/integration.mjs -- LIVE, and deliberately non-blocking.
+  #
+  # *** THIS STEP IS ALLOWED TO BE GREEN WITHOUT BEING CORRECT. ***
+  #
+  # integration.mjs hits a real deployment over the public internet
+  # (GITPP_BASE, default https://gitpp.superinstance.dev). It measured
+  # "22 passed, 0 failed" on 2026-10-18, but its result depends on that
+  # deployment being up, reachable, unauthenticated, and matching the
+  # current surface. A red here can be an outage, a network policy in the
+  # runner, or a deployment that has not caught up -- none of which is a
+  # defect in this repository's fold.
+  #
+  # It is therefore `continue-on-error: true`, stated here rather than left
+  # for someone to discover. It still ASSERTS its own measured count, so the
+  # failure is visible in the log even though it is not blocking.
+  # To make it blocking, delete the `continue-on-error: true` line.
+  #
+  # It is also skipped entirely when the deployment is unreachable, which is
+  # reported as SKIPPED -- never as passed.
+  # ---------------------------------------------------------------------------
+  live-integration:
+    name: live integration (NON-BLOCKING -- needs network + a live deployment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true   # <-- see the comment block above. This step can be green while being wrong.
+    permissions:
+      contents: read
+    env:
+      GITPP_BASE: 'https://gitpp.superinstance.dev'
+      EXPECTED_INTEGRATION: '22'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: reachability probe (a skip is reported as a skip, never as a pass)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if curl -sSf -m 20 "$GITPP_BASE/api/state?project=poc-quilt-1" -o /dev/null; then
+            echo "deployment reachable: $GITPP_BASE"
+            echo "REACHABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::$GITPP_BASE unreachable from this runner; integration.mjs will be SKIPPED, not passed."
+            echo "REACHABLE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: integration.mjs
+        if: env.REACHABLE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/integration.mjs 2>&1 | tee integration.txt
+
+      - name: assert integration (non-blocking, but still asserted)
+        if: env.REACHABLE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -Eq '^[0-9]+ passed, [0-9]+ failed' integration.txt; then
+            echo "::error::integration.mjs produced no '<n> passed, <n> failed' summary."
+            tail -30 integration.txt; exit 1
+          fi
+          got="$(sed -nE 's/^([0-9]+) passed.*/\1/p' integration.txt | head -1)"
+          bad="$(sed -nE 's/^[0-9]+ passed, ([0-9]+) failed.*/\1/p' integration.txt | head -1)"
+          echo "integration (live, non-blocking): $got passed, $bad failed (baseline >= $EXPECTED_INTEGRATION)"
+          [ "$bad" -eq 0 ] || { echo "::error::integration.mjs reported $bad failures."; exit 1; }
+          [ "$got" -ge "$EXPECTED_INTEGRATION" ] || { echo "::error::integration.mjs reported only $got passing assertions, below measured baseline $EXPECTED_INTEGRATION."; exit 1; }
