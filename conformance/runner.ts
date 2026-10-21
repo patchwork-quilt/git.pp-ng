@@ -9,6 +9,7 @@ import {
   buildCheckpoint,
   buildFrontierCheckpoint,
   deriveDelta,
+  recordLeaf,
   type FoldRecord,
 } from "../src/fold.ts";
 
@@ -38,6 +39,10 @@ const results = cases.map((c) => ({
     }),
   ),
   freshness: witnessFreshness(c.records),
+  // checkpoint-v2 record leaf for every record, in case order, compared
+  // Python-vs-TS by the harness (the LEAF-BAND family pins these directly;
+  // the other families ignore the field).
+  leaves: c.records.map((r) => recordLeaf(r)),
   // checkpoint v2 digest for every applied id, compared Python-vs-TS by the
   // harness to prove the closure-root construction is identical across ports.
   roots: Object.fromEntries(
