@@ -2,6 +2,10 @@
   "name": "git.pp-ng",
   "private": true,
   "scripts": {
-    "test": "cd conformance && python3 harness.py"
+    "test": "npm run test:conformance && npm run test:worker && npm run test:runner",
+    "test:conformance": "cd conformance && python3 harness.py",
+    "test:worker": "bun tests/worker-delta.mjs && bun tests/format-v2.mjs && bun tests/security-probes.mjs",
+    "test:runner": "python3 runner/test_refusals.py && python3 runner/test_digest.py",
+    "test:live": "bun tests/integration.mjs"
   }
 }
