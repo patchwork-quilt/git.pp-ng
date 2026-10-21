@@ -120,7 +120,7 @@ function pyNumber(n: number): string {
   // integer). An integral value in that band takes the EXACT integer spelling
   // via BigInt — `String(n)` would give the shortest round-trip, which diverges
   // from Python's int() for integral doubles in [1e16, 1e21) (e.g.
-  // 724818294626474393600, not ...400000). Zero (incl. -0) is "0"; everything
+  // 724818294626474655744, not ...400000). Zero (incl. -0) is "0"; everything
   // else (non-integral, or |v| >= 1e21) goes through Python float repr.
   if (Number.isNaN(n)) return "NaN";
   if (!Number.isFinite(n)) return n > 0 ? "Infinity" : "-Infinity";

@@ -79,7 +79,7 @@ leaf  = SHA-256( UTF-8(canon) )                    # lowercase hex
   - an **integral** value with `|v| < 1e21` → its **exact** integer digits
     (Python `int(v)`; TypeScript `BigInt(v)` — not `String(v)`, whose shortest
     round-trip diverges from the exact integer for integral doubles in
-    `[1e16, 1e21)`, e.g. `724818294626474393600`, not `…400000`);
+    `[1e16, 1e21)`, e.g. `724818294626474655744`, not `…400000`);
   - signed zero (`-0.0`) → `0`;
   - every other finite value → Python's `repr`/`json.dumps` float form
     (shortest round-trip digits; scientific with a sign-prefixed, ≥2-digit
