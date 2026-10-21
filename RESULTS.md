@@ -150,6 +150,33 @@ findings against `DESIGN.md`; the sharpest — §2.5's "candidates" was
 undefined — is fixed in the spec (PR #13), with the pinning corpus case
 quoted in the doc.
 
+Re-run against the grown corpus (2026-10-20): the port had silently
+fallen one feature behind — it predated frontier checkpoints and
+diverged on all ten frontier verify probes. Lockstep fix (gitpp-beam
+PR #9): **derive 898/898 · verify 1,056/1,056 · freshness 3,259/3,259
+· closure-root digests 16,574/16,574**, mutation-proven (breaking the
+frontier union re-breaks seven cases). The port has no delta path and
+now says so in its README.
+
+### 1.7 The leaf-band incident (2026-10-20 validation pass)
+
+A hub-only change moved the TS leaf-number boundary from 1e21 to 1e16
+(issue #28). Measured by execution: for a record carrying `x = 1e18`
+the Python referee and the deployed Worker agreed (`402860c3…`); the
+changed hub disagreed (`7d786310…`). No live project carries a value
+in the band, so no live root ever moved — and the shipped corpus
+could not see the drift at all: **it held no discriminating case in
+[1e16, 1e21)**. Ruling (recorded on #28): the spec of record stands —
+the leaf names the stored float64, whose exact expansion is canonical
+in every port, and shortest-round-trip repr is the surface the spec
+deliberately minimises; the change was reverted (PR #31, deployed).
+The hole is closed by a LEAF-BAND family (PR #33): 12/12 cases, 29
+leaves and 29 closure roots pinned as referee literals; flipping the
+boundary back produces **45 divergences, all inside the family, zero
+elsewhere**. The same pass corrected the spec's own worked example:
+the double nearest 7.248182946264746e20 spells `724818294626474655744`
+exactly (PR #34).
+
 ## 2. What independent readers said
 
 ### 2.1 Judge panels (model panels — see the caveat)
@@ -241,6 +268,13 @@ prose invites the error. Recorded fix, seven words: append
 
 Each item carries the evidence that argues for it.
 
+- **Landed since the first edition of this ledger:** CI with
+  measured assertions on every push (PR #29; negative control PR #30
+  proved the assertions can turn the job red); a one-command battery
+  (`npm test` = conformance + worker + runner suites, PR #32); the
+  LEAF-BAND family (§1.7); and the Brief 7 outbound scanner in the
+  Middleman Kit (30/30 executed tests; its live multi-model
+  evaluation remains unrun and its README says so).
 - **A checkpointed collection read, as a platform feature.** One
   Artifacts binding call returning a project's records — or only the
   delta since a client-supplied closure digest, with per-record content
