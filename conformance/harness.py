@@ -11,6 +11,10 @@ is compared and counted apart so the classic totals stay literally unchanged;
 a FORMAT-V2 family (records born with digests, docs/FORMAT-V2.md) is counted
 apart the same way, and additionally sweeps the whole corpus for the
 born-ignored-by-fold law and root-assembly equivalence;
+a LEAF-BAND family (the checkpoint-v2 leaf-number boundary, issue #28) is
+counted apart the same way, compares every record leaf directly across
+ports, and pins its expected leaves and roots as literals computed from
+the referee, so a boundary drift in either port fails against the pins;
 every case in both families also has its auto-frontier checkpoint checked
 (delta == full derive, covered set == applied set, cross-port identical),
 plus tail-dup scenarios over that checkpoint: a tail record identical to a
@@ -788,6 +792,266 @@ FORMAT_V2_EXPECTED = {
     "fmt-frontier-born": "VERIFIED",
 }
 
+# --- LEAF BAND: the checkpoint-v2 leaf-number boundary (issue #28) ---------
+# The leaf spells an integral float64 with |v| < 1e21 as its EXACT integer
+# digits (docs/CHECKPOINT-V2.md; referee _leaf_num; src/fold.ts pyNumber).
+# In Oct 2026 the TS hub drifted to a 1e16 boundary (issue #28, reverted by
+# PR #31) and the shipped corpus could not see it: no case carried a value
+# in the discriminating band [1e16, 1e21) into a compared leaf or root —
+# the FIX 1 comment above says as much of the classic corpus. These cases
+# form a SEPARATE family (like FRONTIER and FORMAT-V2) so the classic
+# totals stay literally unchanged. Every band value rides in a record whose
+# key a descendant then overrides with an ordinary value: the value is
+# dominated out of the derived STATE (a band value in state would expose
+# the unrelated JSON round-trip subtlety the FIX 1 comment names), but
+# the record is applied, so its leaf is pinned by its own closure root,
+# by the tip root, and by the direct leaf comparison in main().
+# Expected leaves and roots are computed from the PYTHON REFEREE and
+# pinned as literals in LEAF_BAND_PINS below: a drift in EITHER port —
+# or in the referee's own rule — fails against the literals.
+
+LEAF_BAND_CASES = []
+
+
+def _lb(name, records, probes=()):
+    LEAF_BAND_CASES.append({"name": name,
+                            "records": [dict(r) for r in records],
+                            "probes": list(probes)})
+
+
+def _lb_case(name, records, at):
+    _lb(name, records,
+        [{"at": at, "state": closure_state(records, at),
+          "closureRoot": ref.checkpoint_root(
+              [dict(r) for r in records], at)}])
+
+
+# The largest integral double below 1e21: the ulp at 1e21 is 2**17.
+_LB_BELOW_1E21 = 1e21 - 131072.0
+
+# One value alone in its own key, dominated by a child's ordinary 42.
+# The first five DISCRIMINATE the boundary (integral, in [1e16, 1e21)):
+# the 1e21 rule spells them as exact digits, a 1e16 rule as repr.
+# -2**53 sits below both boundaries (exact digits under either), and
+# 1e21 / 2.5e21 sit at and above the boundary (repr under either) —
+# controls pinning the band from outside.
+_LB_SINGLES = [
+    ("1e16", 1e16),
+    ("1e18", 1e18),
+    ("7e20", 7.248182946264746e20),
+    ("below-1e21", _LB_BELOW_1E21),
+    ("neg-1e18", -1e18),
+    ("neg-2pow53", -9007199254740992.0),
+    ("1e21", 1e21),
+    ("2p5e21", 2.5e21),
+]
+for _slug, _val in _LB_SINGLES:
+    _recs = [R("g", [], "task", {"v": _val}),
+             R("t", ["g"], "task", {"v": 42})]
+    _lb_case(f"leaf-band-{_slug}", _recs, "t")
+
+# Controls on the repr / zero paths, state-VISIBLE (the child touches a
+# different key): 2.5e-7 keeps Python's zero-padded exponent form, and
+# -0.0 spells "0" in the leaf.
+for _slug, _val in (("ctrl-2p5e-7", 2.5e-7), ("ctrl-negzero", -0.0)):
+    _recs = [R("g", [], "task", {"v": _val}),
+             R("t", ["g"], "task", {"other": 1})]
+    _lb_case(f"leaf-band-{_slug}", _recs, "t")
+
+# Several band values combined in ONE record (and a second), every key
+# dominated by the tip's ordinary values.
+_LB_COMBO = [
+    R("g", [], "task", {"p": 1e16, "q": 1e18,
+                        "r": 7.248182946264746e20, "s": -1e18}),
+    R("h", ["g"], "task", {"u": _LB_BELOW_1E21, "w": -9007199254740992.0}),
+    R("t", ["h"], "task", {"p": 1, "q": 2, "r": 3, "s": 4, "u": 5, "w": 6}),
+]
+_lb_case("leaf-band-combined", _LB_COMBO, "t")
+
+# A multi-record closure mixing band and ordinary values: band records
+# deep in the ancestry, ordinary overrides above them, the two controls
+# state-visible at the tip's closure, a witness on top.
+_LB_MIXED = [
+    R("g0", [], "task", {"base": 1}),
+    R("a", ["g0"], "task", {"v": 1e18}),
+    R("b", ["a"], "task", {"v": 5, "w": 2.5}),
+    R("c", ["b"], "task", {"u": _LB_BELOW_1E21, "tiny": 2.5e-7, "nz": -0.0}),
+    R("d", ["c"], "task", {"u": 9}),
+    R("w1", ["d"], "witness", {"seen": True}),
+]
+_lb("leaf-band-mixed-closure", _LB_MIXED,
+    [{"at": at, "state": closure_state(_LB_MIXED, at),
+      "closureRoot": ref.checkpoint_root(
+          [dict(r) for r in _LB_MIXED], at)}
+     for at in ("d", "w1")])
+
+# Every leaf-band probe is an honest checkpoint over its own set, so the
+# pinned three-way answer is VERIFIED for each case's first probe.
+LEAF_BAND_EXPECTED = {c["name"]: "VERIFIED" for c in LEAF_BAND_CASES}
+
+# Expected leaves (per record id) and closure roots (per probe `at`),
+# computed from the PYTHON REFEREE and pinned as literals. Filled in
+# below; check_leafband_case in main() holds BOTH ports — and the
+# referee itself — to these literals.
+LEAF_BAND_PINS = {
+    'leaf-band-1e16': {
+        "leaves": {
+            'g':
+                "e5b2a2fc66b13b19da6ec5c82c9c897079c1537ea5e5acca2badf04da1ae81ee",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "83b0c91d22eca7c7bc5c9dd28fa5bd8423d60df7341453894bb9c021ee90e14d",
+        },
+    },
+    'leaf-band-1e18': {
+        "leaves": {
+            'g':
+                "749957718242ce0a6de667a00eec8fdfa2f0f065110e44a6564f23d559b5ac1c",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "3e61a46ce5917b022bd8fee06f2bc2995db25be2887e608af304c5174b7d2117",
+        },
+    },
+    'leaf-band-7e20': {
+        "leaves": {
+            'g':
+                "501942769a223b0670bccd282b51a226c89aa67200876c62ba27d025cad052b9",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "ddc80948cc000dbd417d316f51a63da9328b59873c49a82bb6f46d2c030d2acf",
+        },
+    },
+    'leaf-band-below-1e21': {
+        "leaves": {
+            'g':
+                "b7e2e7b79a66b7416fb07b8907658ada950382f1fcd9d542e6f09babb0c691be",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "7e2c9018889f51a8d394fe8b8ce9895bdc7aacb9207a56d7ba613b11eff19e28",
+        },
+    },
+    'leaf-band-neg-1e18': {
+        "leaves": {
+            'g':
+                "c13d983f3f33bbda456fc10ebc7cddc1559482a4eca0cc30a97595675e5276f5",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "e7b7b67a9d7bcbd773d7c0d6c7882a655ebd5ac3319ac40a4b6a3c2cec26ba95",
+        },
+    },
+    'leaf-band-neg-2pow53': {
+        "leaves": {
+            'g':
+                "8982f3ec450044a671b206f5851c8f716ace5aae95332951b07f211c7730dff9",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "89703f13289ac20f247c0399005099491de2e298cedd7dc109e4e9b7fa17debc",
+        },
+    },
+    'leaf-band-1e21': {
+        "leaves": {
+            'g':
+                "5d5c7ca2e7504d05a28a2839ab307195fa1616bfb9d2ab58b60f66ddc3edacab",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "f27234d3496973dcdc0bd90d01b37bf633b67bfd0a93b5beb1aa3b9724df833b",
+        },
+    },
+    'leaf-band-2p5e21': {
+        "leaves": {
+            'g':
+                "01262be8dbb233de24c06c39538365774533fa45e410dd391edbc429dc4acd3a",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "cc7bedc7938dae01bfd075decab7177b81909a18d8efc06c9368d248b07fc9db",
+        },
+    },
+    'leaf-band-ctrl-2p5e-7': {
+        "leaves": {
+            'g':
+                "3e42dd20b251410b4ed92bf00e6ab8b7efd272c07481fe8ed52a96236395853d",
+            't':
+                "14ff2aad144c4c29b07172d62d183adc92689ef4473987b43f81c0516783f512",
+        },
+        "roots": {
+            't':
+                "bfa9d2cf1a0adf42062b99746830a369327efa6b236102705f61476a2dd3112c",
+        },
+    },
+    'leaf-band-ctrl-negzero': {
+        "leaves": {
+            'g':
+                "75926594e5931a7cabd2f3bf07446bc0292589b858cb0adc13c278a40193cecc",
+            't':
+                "14ff2aad144c4c29b07172d62d183adc92689ef4473987b43f81c0516783f512",
+        },
+        "roots": {
+            't':
+                "a30eacf1e9e913fc3b5465806282150b43cd70cc18068c1cf9a06b0b71bb7e31",
+        },
+    },
+    'leaf-band-combined': {
+        "leaves": {
+            'g':
+                "1fe8417da1c44aaefacf2ba68b9b1b7fd283986ed73f2ebef6f6f39036261ddf",
+            'h':
+                "8bf5470633ff99d9944b8164b89e6279a14749c23d138cc04b3b2fa21f8696f4",
+            't':
+                "b07ab810319a2da06b2535656ca6d92cf08180284c35326e4875a0df66e85b9b",
+        },
+        "roots": {
+            't':
+                "ad646f74708254337df1a952cecb8dd8052f255f180c8e75fa50e180618072b7",
+        },
+    },
+    'leaf-band-mixed-closure': {
+        "leaves": {
+            'g0':
+                "7868102b2fe38a332c7f74c9198351fb5d428e89922d52a7f54d060c069344c8",
+            'a':
+                "c49811aa37d69ac8e9917c38e10892d8ec298704db0cd56dc7b7676ee1c7513d",
+            'b':
+                "cb57efd1ea7713fe33f60feaebe8c0dbac560d65bcf8da931aec07785e004308",
+            'c':
+                "298653fdbe6a3fba360f7c3068164ecd4053c186bca814dce8531b3e4becf12e",
+            'd':
+                "36987dc4d85af7777f04d81ab3052542fd49bc13a54a54bde98523b6828c7610",
+            'w1':
+                "c1787a9031acd1a457219a92b0e4e17b231ce1b374224ddd04e749ee87605f6a",
+        },
+        "roots": {
+            'd':
+                "96ee933f3ca4e95e89028aa71c6fd2271549d978635aa1d2e51a42d5d034798c",
+            'w1':
+                "5b0133688c8b2ee725cab2a106bb439d7477084abcf6cea41dbe6b73ac9067d0",
+        },
+    },
+}
+
 
 def _ancestors(start, parents, restrict=None):
     """Full ancestor set of `start` (optionally restricted to `restrict`)."""
@@ -926,7 +1190,8 @@ def main():
     # construction instead — non-finite numbers are out of the record domain
     # (see DESIGN.md §6).
     cases_path.write_text(json.dumps(
-        CASES + FRONTIER_CASES + FORMAT_V2_CASES, allow_nan=False))
+        CASES + FRONTIER_CASES + FORMAT_V2_CASES + LEAF_BAND_CASES,
+        allow_nan=False))
     print(f"harness: {len(CASES)} cases, "
           f"{sum(len(c['probes']) for c in CASES)} checkpoint probes "
           f"+ {len(FRONTIER_CASES)} frontier cases, "
@@ -1167,12 +1432,130 @@ def main():
         if got.get("taildup") != exp_td:
             divergences.append((name, "tail-dup scenarios differ across ports"))
 
+    lb = {"leaves": 0, "roots": 0, "frontier_deltas": 0}
+
+    def check_leafband_case(case):
+        # The full cross-port battery (the same assertions as check_case,
+        # counted on the LEAF-BAND line only), PLUS the family's own
+        # point: every record's LEAF compared directly — the TS port's
+        # recordLeaf (emitted by the runner) against the referee's
+        # _record_leaf — and both ports AND the referee held to the
+        # LEAF_BAND_PINS literals, so the boundary rule itself is pinned,
+        # not merely agreed between two ports that could drift together.
+        name = case["name"]
+        recs = [dict(r) for r in case["records"]]
+        exp_derive = derive(recs)
+        got = ts_results.get(name)
+        if got is None:
+            divergences.append((name, "missing from TS results"))
+            return
+        if got["derive"] != exp_derive:
+            divergences.append((name, "derive differs"))
+        exp_leaves = [ref._record_leaf(dict(r)) for r in recs]
+        if got.get("leaves") != exp_leaves:
+            divergences.append((name, "record leaves differ across ports"))
+        lb["leaves"] += len(exp_leaves)
+        pins = LEAF_BAND_PINS.get(name)
+        if pins is not None:
+            _by_id = {r["id"]: i for i, r in enumerate(recs)}
+            _ts_leaves = got.get("leaves") or []
+            for _rid, _lit in pins["leaves"].items():
+                _i = _by_id[_rid]
+                if exp_leaves[_i] != _lit:
+                    divergences.append(
+                        (name, f"referee leaf for {_rid} != pinned literal"))
+                if _i >= len(_ts_leaves) or _ts_leaves[_i] != _lit:
+                    divergences.append(
+                        (name, f"TS leaf for {_rid} != pinned literal"))
+            for _at, _lit in pins["roots"].items():
+                if ref.checkpoint_root([dict(r) for r in recs], _at) != _lit:
+                    divergences.append(
+                        (name, f"referee root @{_at} != pinned literal"))
+                if (got.get("roots") or {}).get(_at) != _lit:
+                    divergences.append(
+                        (name, f"TS root @{_at} != pinned literal"))
+        exp_verify = [
+            verify([dict(r) for r in case["records"]],
+                   {k: p[k] for k in ("at", "state", "closureRoot") if k in p})
+            for p in case["probes"]
+        ]
+        if got["verify"] != exp_verify:
+            divergences.append(
+                (name, f"verify differs: py={exp_verify} ts={got['verify']}"))
+        exp_fresh = ref.witness_freshness(recs)
+        if got.get("freshness") != exp_fresh:
+            divergences.append((name, "freshness differs across ports"))
+        exp_roots = {rid: ref.checkpoint_root(recs, rid)
+                     for rid in exp_derive["order"]}
+        if got.get("roots") != exp_roots:
+            divergences.append((name, "closure-root digests differ"))
+        lb["roots"] += len(exp_roots)
+        # Delta derivation at every legal checkpoint position, as in
+        # check_case.
+        exp_deltas = {}
+        for rid in exp_derive["order"]:
+            cp = ref.build_checkpoint(recs, rid)
+            if cp is None:
+                exp_deltas[rid] = None
+                continue
+            closure_ids = {r["id"] for r in cp["closure"]}
+            tail = [dict(r) for r in case["records"]
+                    if r.get("id") not in closure_ids]
+            d = ref.derive_delta(cp, tail)
+            exp_deltas[rid] = d
+            if d != exp_derive:
+                divergences.append((name, f"delta@{rid} != full derive"))
+        if got.get("deltas") != exp_deltas:
+            divergences.append((name, "delta derivation differs across ports"))
+        # Auto-frontier checkpoint + tail-dup scenarios, as in check_case.
+        fcp = ref.build_frontier_checkpoint(recs)
+        got_f = got.get("frontier")
+        if fcp is None:
+            if got_f is not None:
+                divergences.append(
+                    (name, "frontier checkpoint: TS built one, referee none"))
+            return
+        if got_f is None:
+            divergences.append(
+                (name, "frontier checkpoint: referee built one, TS none"))
+            return
+        lb["frontier_deltas"] += 1
+        if {r["id"] for r in fcp["closure"]} != set(exp_derive["order"]):
+            divergences.append((name, "frontier covered set != applied set"))
+        fclosure_ids = {r["id"] for r in fcp["closure"]}
+        ftail = [dict(r) for r in recs if r.get("id") not in fclosure_ids]
+        exp_fd = ref.derive_delta(fcp, ftail)
+        if exp_fd != exp_derive:
+            divergences.append((name, "frontier delta != full derive"))
+        if (got_f.get("at") != fcp["at"]
+                or got_f.get("closureRoot") != fcp["closureRoot"]
+                or got_f.get("covered") != len(fcp["closure"])
+                or got_f.get("delta") != exp_fd):
+            divergences.append(
+                (name, "frontier checkpoint differs across ports"))
+        _covered0 = fcp["closure"][0]
+        _dup = json.loads(json.dumps(_covered0))
+        _div = json.loads(json.dumps(_covered0))
+        _div["effects"] = {"__taildup__": "divergent"}
+        exp_td = {"dup": ref.derive_delta(fcp, ftail + [_dup]),
+                  "div": ref.derive_delta(fcp, ftail + [_div])}
+        if exp_td["dup"] != exp_derive:
+            divergences.append(
+                (name, "tail-dup: identical duplicate != full derive"))
+        if exp_td["div"] is not None:
+            divergences.append(
+                (name, "tail-dup: divergent copy engaged — must be None"))
+        if got.get("taildup") != exp_td:
+            divergences.append((name, "tail-dup scenarios differ across ports"))
+
     for case in CASES:
         check_case(case)
     for case in FRONTIER_CASES:
         check_case(case)
     for case in FORMAT_V2_CASES:
         check_fmt_case(case)
+    for case in LEAF_BAND_CASES:
+        check_leafband_case(case)
 
     total_probes = sum(len(c["probes"]) for c in CASES)
     total_witnesses = sum(
@@ -1278,6 +1661,17 @@ def main():
         _fmt_by_name = {c["name"]: c for c in FORMAT_V2_CASES}
         for _nm, _want in FORMAT_V2_EXPECTED.items():
             _c = _fmt_by_name[_nm]
+            _got = verify([dict(r) for r in _c["records"]],
+                          {k: _c["probes"][0][k]
+                           for k in ("at", "state", "closureRoot")
+                           if k in _c["probes"][0]})
+            assert _got == _want, \
+                f"{_nm}: expected {_want}, referee gave {_got}"
+        # LEAF-BAND verdict pins: the referee gives the PINNED answer for
+        # each leaf-band case (every probe is an honest checkpoint).
+        _lb_by_name = {c["name"]: c for c in LEAF_BAND_CASES}
+        for _nm, _want in LEAF_BAND_EXPECTED.items():
+            _c = _lb_by_name[_nm]
             _got = verify([dict(r) for r in _c["records"]],
                           {k: _c["probes"][0][k]
                            for k in ("at", "state", "closureRoot")
@@ -1394,6 +1788,14 @@ def main():
           f"fmt-dup-copied-digest caught by assembly, VERIFIED by "
           f"recompute; poc-quilt-1@task-c root {POC_QUILT1_TASK_C_ROOT[:12]}… "
           f"unmoved — all pass")
+    print(f"LEAF-BAND: {len(LEAF_BAND_CASES)}/{len(LEAF_BAND_CASES)} cases "
+          f"identical (derive + verify + freshness + roots + deltas, both "
+          f"ports); {lb['leaves']} record leaves compared directly "
+          f"cross-port; {lb['roots']} closure-root digests; "
+          f"{sum(len(c['probes']) for c in LEAF_BAND_CASES)} verdict "
+          f"probes; leaves and roots pinned as referee literals — "
+          f"integral doubles in [1e16, 1e21) spelled as exact integer "
+          f"digits, 1e21 on the repr path — all pass")
     return 0
 
 
