@@ -57,6 +57,12 @@ ceiling. Under bun the same derive is 81 ms median / 75.4 MB peak.
 TypeScript fold == Python referee == independent brute-force oracle at
 62 / 250 / 1,000 / 2,500 / 5,000 records. Verdicts from the chaos round:
 
+*Editor's note (2026-10-21): the verdict stamps below are the chaos
+round's own words from its trial counts — ten barrier-synchronised
+trials in one case. Two independent cold readers of this ledger
+flagged the stamps as stronger than the numbers carrying them. Read
+the numbers, not the stamps.*
+
 - **Scale: READY-WITH-LIMITS** — per-request derivation comfortable to
   ~1,000 records/project; the collection read, not the fold, is the
   remaining cost (§1.4).
