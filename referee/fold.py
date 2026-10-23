@@ -78,13 +78,46 @@ def _index_sort_key(r):
     return json.dumps(r, sort_keys=True, default=str)
 
 
+def _missing_id_placeholder(rec):
+    """The orphan-class placeholder for a record whose id is missing or not
+    a string (issue #38): "missing-id:" + the SHA-256 of the record's
+    canonical content with the id field EXCLUDED — the _record_leaf
+    normalisation minus id, so the digest is computed by the pinned leaf
+    machinery. DESIGN §1 defines a record as carrying a string `id` but
+    is silent on a record that lacks one; the fold's ruling is that such
+    a record is indexed under this placeholder and derive() holds it an
+    orphan: it can never be referenced or applied, and it never silently
+    merges with another id-less record — distinct contents give distinct
+    placeholders, while identical contents are the same record served
+    twice and share one."""
+    normalized = {
+        "parents": sorted(_parents(rec)),
+        "kind": rec.get("kind"),
+        "effects": {k: _leaf_num(_canon_num(v))
+                    for k, v in _effects(rec).items()},
+        "reason": rec.get("reason"),
+    }
+    canon = json.dumps(normalized, sort_keys=True, ensure_ascii=True,
+                       separators=(", ", ": "))
+    return "missing-id:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _effective_id(rec):
+    """The index key for a record: its id when it is a string, else the
+    missing-id placeholder (issue #38). Before this ruling a non-string
+    id was String()-coerced (42 and "42" collided) and a missing id
+    raised KeyError here."""
+    rid = rec.get("id")
+    return rid if isinstance(rid, str) else _missing_id_placeholder(rec)
+
+
 def _index(records):
     """id -> record, built in a canonical order so input permutation cannot matter."""
     ordered = sorted(
         records,
-        key=lambda r: (str(r.get("id", "")), _index_sort_key(r)),
+        key=lambda r: (_effective_id(r), _index_sort_key(r)),
     )
-    return {str(r["id"]): r for r in ordered}
+    return {_effective_id(r): r for r in ordered}
 
 
 def _parents(rec):
@@ -287,7 +320,13 @@ def derive(records):
     # orphaned. Propagated with a worklist (O(N+E)) rather than a repeated rescan,
     # which is quadratic when ids happen to sort dependants before their parents.
     orphan = set()
-    work = [rid for rid in idx if any(p not in ids for p in parents[rid])]
+    # Records indexed under a missing-id placeholder are orphans by
+    # construction (issue #38): seeded into the worklist alongside the
+    # missing-parent records, so the exclusion propagates to anything
+    # blocked behind them.
+    work = [rid for rid in idx
+            if not isinstance(idx[rid].get("id"), str)
+            or any(p not in ids for p in parents[rid])]
     orphan.update(work)
     head = 0
     while head < len(work):

@@ -56,9 +56,9 @@ const results = cases.map((c) => ({
     derive(c.records).order.map((id) => {
       const cp = buildCheckpoint(c.records, id);
       if (cp === null) return [id, null];
-      const closureSet = new Set(cp.closure.map((r) => String((r as { id?: unknown }).id)));
+      const closureSet = new Set(cp.closure.map((r) => (r as { id?: unknown }).id));
       const tail = c.records.filter(
-        (r) => !closureSet.has(String((r as { id?: unknown }).id)),
+        (r) => !closureSet.has((r as { id?: unknown }).id),
       );
       return [id, deriveDelta(cp, tail)];
     }),
@@ -71,10 +71,10 @@ const results = cases.map((c) => ({
     const fcp = buildFrontierCheckpoint(c.records);
     if (fcp === null) return null;
     const closureSet = new Set(
-      fcp.closure.map((r) => String((r as { id?: unknown }).id)),
+      fcp.closure.map((r) => (r as { id?: unknown }).id),
     );
     const tail = c.records.filter(
-      (r) => !closureSet.has(String((r as { id?: unknown }).id)),
+      (r) => !closureSet.has((r as { id?: unknown }).id),
     );
     return {
       at: fcp.at,
@@ -94,10 +94,10 @@ const results = cases.map((c) => ({
     const fcp = buildFrontierCheckpoint(c.records);
     if (fcp === null) return null;
     const closureSet = new Set(
-      fcp.closure.map((r) => String((r as { id?: unknown }).id)),
+      fcp.closure.map((r) => (r as { id?: unknown }).id),
     );
     const tail = c.records.filter(
-      (r) => !closureSet.has(String((r as { id?: unknown }).id)),
+      (r) => !closureSet.has((r as { id?: unknown }).id),
     );
     const covered = fcp.closure[0];
     const dup = JSON.parse(JSON.stringify(covered)) as FoldRecord;
