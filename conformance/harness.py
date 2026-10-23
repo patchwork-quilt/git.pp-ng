@@ -15,6 +15,11 @@ a LEAF-BAND family (the checkpoint-v2 leaf-number boundary, issue #28) is
 counted apart the same way, compares every record leaf directly across
 ports, and pins its expected leaves and roots as literals computed from
 the referee, so a boundary drift in either port fails against the pins;
+a PROTO-INDEX family (issue #38: "__proto__" as an effect key and as a
+record id, and records with a missing or non-string id) is counted apart
+the same way and pins its derived orphans, state and freshness as
+literals, so the ruling those cases encode binds the referee as well as
+the ports;
 every case in both families also has its auto-frontier checkpoint checked
 (delta == full derive, covered set == applied set, cross-port identical),
 plus tail-dup scenarios over that checkpoint: a tail record identical to a
@@ -1182,6 +1187,132 @@ def live_golden():
     return checks
 
 
+# --- PROTO-INDEX family (issue #38): "__proto__" as an effect key, as a
+# record id, and records whose id is missing or not a string. The fold
+# indexed records, effects and setters into plain JS objects, where
+# "__proto__" is a prototype write rather than an entry: an effect key
+# "__proto__" vanished from derived state, a record with id "__proto__"
+# vanished from the index (orphaning its children), id-less records
+# collided on one slot and all but the last were silently dropped, and
+# a numeric id was String()-coerced into collision with the same digits
+# as a string id. The referee handled "__proto__" natively (Python
+# dicts) but RAISED KeyError on a missing id — the behaviour there was
+# undefined, not merely divergent. DESIGN §1 defines a record as
+# carrying a string `id` and is silent on a record without one; the
+# ruling pinned by this family: "__proto__" keys and ids are ordinary
+# entries, and a record whose id is missing or not a string is indexed
+# under a placeholder "missing-id:<sha256 of its canonical content
+# minus the id field>" and held an orphan — never referenced, never
+# applied, never merged with another id-less record (identical contents
+# are the same record served twice and share one placeholder). A
+# SEPARATE family, counted apart like LEAF-BAND so the classic totals
+# stay literally unchanged; the derived orphans/state/freshness of every
+# case are pinned as literals below (computed from the referee), so the
+# pins bind BOTH ports AND the referee to the ruling — cross-port
+# agreement alone would let a shared wrong semantics (like the old
+# 42/"42" coercion, on which both ports agreed) pass silently.
+
+PROTO_INDEX_CASES = []
+
+
+def _pi(name, records, ats=()):
+    recs = [dict(r) for r in records]
+    probes = probes_for(recs, list(ats)) if ats else []
+    PROTO_INDEX_CASES.append({"name": name, "records": recs,
+                              "probes": probes})
+
+
+_pi("proto-effect-key", [
+    R("g", [], "task", {"__proto__": 7, "normal": 1}),
+    R("u", ["g"], "override", {"__proto__": 9},
+      reason="the proto key, contested and won"),
+    R("t", ["g"], "task", {"other": 2}),
+], ats=["u", "t"])
+
+_pi("proto-id", [
+    R("__proto__", [], "task", {"x": 1}),
+    R("kid", ["__proto__"], "task", {"y": 2}),
+    R("kid2", ["kid"], "override", {"x": 3},
+      reason="a descendant override through the proto record"),
+], ats=["kid2"])
+
+_pi("proto-witness", [
+    R("base", [], "task", {"a": 1}),
+    R("__proto__", ["base"], "witness", {"seen": True}),
+], ats=["base"])
+
+_pi("proto-combined", [
+    R("__proto__", [], "task", {"__proto__": {"nested": True}, "plain": 0}),
+    R("kid", ["__proto__"], "task", {"via": 1}),
+    R("u", ["kid"], "override", {"__proto__": 9},
+      reason="wins the proto key over the proto record"),
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+])
+
+_pi("missing-id-lone", [
+    R("a", [], "task", {"k": 1}),
+    R("b", ["a"], "task", {"k": 2, "m": 5}, reason="wins k"),
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+])
+
+_pi("missing-id-two-distinct", [
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+    {"parents": [], "kind": "task", "effects": {"phantom": 2}},
+    R("real", [], "task", {"solid": 3}),
+])
+
+_pi("missing-id-twins", [
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+    R("real", [], "task", {"solid": 3}),
+])
+
+_pi("nonstring-ids", [
+    {"id": 42, "parents": [], "kind": "task", "effects": {"fromNum": 1}},
+    {"id": None, "parents": [], "kind": "task", "effects": {"fromNull": 1}},
+    {"id": True, "parents": [], "kind": "task", "effects": {"fromBool": 1}},
+    R("42", [], "task", {"fromStr": 2}),
+    R("s", ["42"], "task", {"after": 1}),
+])
+
+_pi("nonstring-same-content", [
+    {"id": 42, "parents": [], "kind": "task", "effects": {"same": 1}},
+    {"parents": [], "kind": "task", "effects": {"same": 1}},
+    R("real", [], "task", {"solid": 3}),
+])
+
+_PI_GHOST = "missing-id:65677a064ab283d269cd943f7796eded5ecc19e3fb17cae33ba872d39ef5a841"
+_PI_PHANTOM = "missing-id:aa78df5e10a08b98dcafa428cd274a866aaf3488cb8a393cd9016db783c83968"
+
+PROTO_INDEX_PINS = {
+    "proto-effect-key": {
+        "state": {"__proto__": 9, "normal": 1, "other": 2}, "orphans": []},
+    "proto-id": {
+        "state": {"x": 3, "y": 2}, "orphans": []},
+    "proto-witness": {
+        "state": {"a": 1, "seen": True}, "orphans": [],
+        "freshness": {"__proto__": 0}},
+    "proto-combined": {
+        "state": {"__proto__": 9, "plain": 0, "via": 1},
+        "orphans": [_PI_GHOST]},
+    "missing-id-lone": {
+        "state": {"k": 2, "m": 5}, "orphans": [_PI_GHOST]},
+    "missing-id-two-distinct": {
+        "state": {"solid": 3}, "orphans": [_PI_GHOST, _PI_PHANTOM]},
+    "missing-id-twins": {
+        "state": {"solid": 3}, "orphans": [_PI_GHOST]},
+    "nonstring-ids": {
+        "state": {"after": 1, "fromStr": 2},
+        "orphans": [
+            "missing-id:4db1a2ef90f988b899ea3822835be76bbe0ef958fc3862083781d20e636f617e",
+            "missing-id:555ac0dddfb267a2fbc9c55132d243eb72254bc8323648dd99244622061a01f8",
+            "missing-id:8eabf76b7166c230331c9cc563d7b66c85b87161a44d2146236f0493984204d8"]},
+    "nonstring-same-content": {
+        "state": {"solid": 3},
+        "orphans": ["missing-id:9415e1be788fcb5f8c05fe73d4defac689fe0e6b40b8954b070a2a2913eafa6e"]},
+}
+
+
 def main():
     cases_path = HERE / "cases.json"
     results_path = HERE / "results.ts.json"
@@ -1190,7 +1321,8 @@ def main():
     # construction instead — non-finite numbers are out of the record domain
     # (see DESIGN.md §6).
     cases_path.write_text(json.dumps(
-        CASES + FRONTIER_CASES + FORMAT_V2_CASES + LEAF_BAND_CASES,
+        CASES + FRONTIER_CASES + FORMAT_V2_CASES + LEAF_BAND_CASES
+        + PROTO_INDEX_CASES,
         allow_nan=False))
     print(f"harness: {len(CASES)} cases, "
           f"{sum(len(c['probes']) for c in CASES)} checkpoint probes "
@@ -1552,10 +1684,50 @@ def main():
         check_case(case)
     for case in FRONTIER_CASES:
         check_case(case)
+    def check_proto_index_case(case):
+        # The shared battery first (derive, verdict probes, witness
+        # freshness, closure roots, frontier + per-closure deltas,
+        # tail-dups), then the family's own literal pins: the referee AND
+        # the TS port must both produce the pinned orphans/state (and
+        # freshness where pinned) — the pins are the issue-#38 ruling,
+        # stated independently of either implementation.
+        check_case(case)
+        name = case["name"]
+        pins = PROTO_INDEX_PINS[name]
+        exp = derive([dict(r) for r in case["records"]])
+        got = ts_results.get(name)
+        if got is None:
+            divergences.append((name, "missing from TS results"))
+            return
+        for label, out in (("referee", exp), ("ts", got["derive"])):
+            if out["orphans"] != pins["orphans"]:
+                divergences.append(
+                    (name, f"{label} orphans {out['orphans']} != pinned "
+                           f"{pins['orphans']}"))
+            if out["state"] != pins["state"]:
+                divergences.append(
+                    (name, f"{label} state "
+                           f"{json.dumps(out['state'], sort_keys=True)} "
+                           f"!= pinned "
+                           f"{json.dumps(pins['state'], sort_keys=True)}"))
+        if "freshness" in pins:
+            exp_fresh = ref.witness_freshness(
+                [dict(r) for r in case["records"]])
+            if exp_fresh != pins["freshness"]:
+                divergences.append(
+                    (name, f"referee freshness {exp_fresh} != pinned "
+                           f"{pins['freshness']}"))
+            if got["freshness"] != pins["freshness"]:
+                divergences.append(
+                    (name, f"ts freshness {got['freshness']} != pinned "
+                           f"{pins['freshness']}"))
+
     for case in FORMAT_V2_CASES:
         check_fmt_case(case)
     for case in LEAF_BAND_CASES:
         check_leafband_case(case)
+    for case in PROTO_INDEX_CASES:
+        check_proto_index_case(case)
 
     total_probes = sum(len(c["probes"]) for c in CASES)
     total_witnesses = sum(
@@ -1796,6 +1968,13 @@ def main():
           f"probes; leaves and roots pinned as referee literals — "
           f"integral doubles in [1e16, 1e21) spelled as exact integer "
           f"digits, 1e21 on the repr path — all pass")
+    print(f"PROTO-INDEX: {len(PROTO_INDEX_CASES)}/{len(PROTO_INDEX_CASES)} "
+          f"cases identical (derive + verify + freshness + roots + "
+          f"deltas, both ports); orphans, state and freshness pinned as "
+          f"literals for every case — \"__proto__\" is an ordinary "
+          f"effect key and record id, and a missing or non-string id is "
+          f"orphan-class under a content-digest placeholder "
+          f"(issue #38) — all pass")
     return 0
 
 

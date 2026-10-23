@@ -207,7 +207,10 @@ function parentsOf(rec: FoldRecord): string[] {
 
 function effectsOf(rec: FoldRecord): { [key: string]: unknown } {
   const eff = (rec as { effects?: unknown }).effects;
-  const out: { [key: string]: unknown } = {};
+  // Null-prototype: effect keys are arbitrary strings, and on a plain {}
+  // the key "__proto__" is not an entry but a prototype write — the key
+  // silently vanished here (issue #38).
+  const out: { [key: string]: unknown } = Object.create(null);
   if (eff && typeof eff === "object" && !Array.isArray(eff)) {
     for (const [k, v] of Object.entries(eff as { [key: string]: unknown })) {
       out[String(k)] = v;
@@ -261,24 +264,75 @@ function indexKey(rec: FoldRecord): string {
   return pyCanonical(rest);
 }
 
+/** A string-keyed map with no prototype, so arbitrary record ids and
+ * effect keys — "__proto__" above all — are ordinary entries (issue
+ * #38). On a plain {}, assigning to "__proto__" writes the object's
+ * prototype instead of a property, and the entry silently vanishes. */
+function newStrMap<T>(): { [key: string]: T } {
+  return Object.create(null);
+}
+
+/** Assign an own enumerable data property even for the key "__proto__",
+ * where plain assignment would write the object's prototype instead
+ * (issue #38). Used for the fold's OUTPUT objects (derived state,
+ * witness freshness), whose shape and prototype stay as they were. */
+function setOwn<T>(obj: { [key: string]: T }, k: string, v: T): void {
+  Object.defineProperty(obj, k, {
+    value: v,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/** The orphan-class placeholder for a record whose id is missing or not
+ * a string (issue #38): "missing-id:" + SHA-256 of the record's
+ * canonical content with the id field EXCLUDED — the recordLeaf
+ * normalisation minus id, computed by the pinned digest machinery.
+ * DESIGN §1 defines a record as carrying a string `id` but is silent on
+ * a record that lacks one; the fold's ruling is that such a record is
+ * indexed under this placeholder and derive() holds it an orphan: it
+ * can never be referenced or applied, and it never silently merges with
+ * another id-less record — distinct contents give distinct
+ * placeholders, while identical contents are the same record served
+ * twice and share one. Mirrors the referee's _missing_id_placeholder. */
+function missingIdPlaceholder(rec: FoldRecord): string {
+  const r = rec as { kind?: unknown; reason?: unknown };
+  const normalized = {
+    parents: parentsOf(rec).slice().sort(cmpCodePoints),
+    kind: r.kind ?? null,
+    effects: effectsOf(rec),
+    reason: r.reason ?? null,
+  };
+  return "missing-id:" + sha256Hex(pyCanonical(normalized));
+}
+
+/** The index key for a record: its id when it is a string, else the
+ * missing-id placeholder. Mirrors the referee's _effective_id. Before
+ * this ruling a non-string id was String()-coerced (42 and "42"
+ * collided in one index slot) and a missing id keyed every such record
+ * to "undefined", each overwriting the last. */
+function effectiveId(rec: FoldRecord): string {
+  const id = (rec as { id?: unknown }).id;
+  return typeof id === "string" ? id : missingIdPlaceholder(rec);
+}
+
 /** id -> record, built in the same canonical order the Python referee
  * uses, so input permutation (and duplicate-id resolution) cannot differ. */
 function indexRecords(
   records: FoldRecord[],
 ): { [id: string]: FoldRecord } {
   const ordered = [...records].sort((a, b) => {
-    const ida = String((a as { id?: unknown }).id ?? "");
-    const idb = String((b as { id?: unknown }).id ?? "");
-    const byId = cmpCodePoints(ida, idb);
+    const byId = cmpCodePoints(effectiveId(a), effectiveId(b));
     if (byId !== 0) return byId;
     // Secondary key: Python sorts by json.dumps(..., sort_keys=True), which
     // ensure_ascii escapes to pure ASCII; pyCanonical matches byte-for-byte,
     // so a code-point compare here is identical to Python's.
     return cmpCodePoints(indexKey(a), indexKey(b));
   });
-  const idx: { [id: string]: FoldRecord } = {};
+  const idx: { [id: string]: FoldRecord } = newStrMap();
   for (const r of ordered) {
-    idx[String((r as { id?: unknown }).id)] = r;
+    idx[effectiveId(r)] = r;
   }
   return idx;
 }
@@ -331,8 +385,8 @@ type ParentsMap = { [id: string]: string[] };
 /** Nodes that cannot be topologically ordered (in, or blocked behind, a
  * parent cycle). Mirrors fold.py's _cycle_affected. */
 function cycleAffected(nodes: Set<string>, parents: ParentsMap): Set<string> {
-  const indeg: { [id: string]: number } = {};
-  const children: { [id: string]: string[] } = {};
+  const indeg: { [id: string]: number } = newStrMap();
+  const children: { [id: string]: string[] } = newStrMap();
   for (const r of nodes) {
     indeg[r] = 0;
     children[r] = [];
@@ -364,8 +418,8 @@ function cycleAffected(nodes: Set<string>, parents: ParentsMap): Set<string> {
 /** Kahn's algorithm, always taking the smallest ready id: one canonical
  * order. Mirrors fold.py's _topological (indegree counts all parents). */
 function topological(nodes: Set<string>, parents: ParentsMap): string[] {
-  const indeg: { [id: string]: number } = {};
-  const children: { [id: string]: string[] } = {};
+  const indeg: { [id: string]: number } = newStrMap();
+  const children: { [id: string]: string[] } = newStrMap();
   for (const r of nodes) {
     indeg[r] = parents[r].length;
     children[r] = [];
@@ -408,10 +462,10 @@ function topological(nodes: Set<string>, parents: ParentsMap): string[] {
 export function deriveLegacy(records: FoldRecord[]): DeriveOutput {
   const idx = indexRecords([...records]);
   const ids = new Set<string>(Object.keys(idx));
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
 
-  const children: { [id: string]: string[] } = {};
+  const children: { [id: string]: string[] } = newStrMap();
   for (const rid of Object.keys(idx)) children[rid] = [];
   for (const [rid, ps] of Object.entries(parents)) {
     for (const p of ps) {
@@ -426,7 +480,15 @@ export function deriveLegacy(records: FoldRecord[]): DeriveOutput {
   const orphan = new Set<string>();
   const work: string[] = [];
   for (const rid of Object.keys(idx)) {
-    if (parents[rid].some((p) => !ids.has(p))) work.push(rid);
+    // Records indexed under a missing-id placeholder are orphans by
+    // construction (issue #38): seeded into the worklist alongside the
+    // missing-parent records, so the exclusion propagates.
+    if (
+      typeof (idx[rid] as { id?: unknown }).id !== "string" ||
+      parents[rid].some((p) => !ids.has(p))
+    ) {
+      work.push(rid);
+    }
   }
   for (const rid of work) orphan.add(rid);
   let head = 0;
@@ -455,7 +517,7 @@ export function deriveLegacy(records: FoldRecord[]): DeriveOutput {
   // would itself be an orphan. Precomputing here means no ancestor walk is
   // repeated across candidates or keys — the per-candidate re-walks were
   // superlinear on deep contested keys (ADDENDUM #4 P5). Mirrors fold.py.
-  const anc: { [id: string]: Set<string> } = {};
+  const anc: { [id: string]: Set<string> } = newStrMap();
   for (const rid of order) {
     const a = new Set<string>();
     for (const p of parents[rid]) {
@@ -468,7 +530,7 @@ export function deriveLegacy(records: FoldRecord[]): DeriveOutput {
   }
 
   // Who sets each key, among applied records only.
-  const setters: { [key: string]: Set<string> } = {};
+  const setters: { [key: string]: Set<string> } = newStrMap();
   for (const rid of applied) {
     for (const k of Object.keys(effectsOf(idx[rid]))) {
       if (!setters[k]) setters[k] = new Set<string>();
@@ -519,7 +581,7 @@ export function deriveLegacy(records: FoldRecord[]): DeriveOutput {
       })[0];
     }
 
-    state[k] = effectsOf(idx[winner])[k];
+    setOwn(state, k, effectsOf(idx[winner])[k]);
     const distinct = new Set<string>();
     for (const c of cands) distinct.add(pyValueKey(effectsOf(idx[c])[k]));
     if (distinct.size >= 2) {
@@ -567,10 +629,10 @@ interface PreparedDerive {
 function prepareDerive(records: FoldRecord[]): PreparedDerive {
   const idx = indexRecords([...records]);
   const ids = new Set<string>(Object.keys(idx));
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
 
-  const children: { [id: string]: string[] } = {};
+  const children: { [id: string]: string[] } = newStrMap();
   for (const rid of Object.keys(idx)) children[rid] = [];
   for (const [rid, ps] of Object.entries(parents)) {
     for (const p of ps) {
@@ -583,7 +645,15 @@ function prepareDerive(records: FoldRecord[]): PreparedDerive {
   const orphan = new Set<string>();
   const work: string[] = [];
   for (const rid of Object.keys(idx)) {
-    if (parents[rid].some((p) => !ids.has(p))) work.push(rid);
+    // Records indexed under a missing-id placeholder are orphans by
+    // construction (issue #38): seeded into the worklist alongside the
+    // missing-parent records, so the exclusion propagates.
+    if (
+      typeof (idx[rid] as { id?: unknown }).id !== "string" ||
+      parents[rid].some((p) => !ids.has(p))
+    ) {
+      work.push(rid);
+    }
   }
   for (const rid of work) orphan.add(rid);
   let head = 0;
@@ -688,7 +758,7 @@ export function derive(records: FoldRecord[]): DeriveOutput {
   const anc = buildAncestry(order, parents, idx);
 
   // Who sets each key, among applied records only (as deriveLegacy).
-  const setters: { [key: string]: Set<string> } = {};
+  const setters: { [key: string]: Set<string> } = newStrMap();
   for (const rid of applied) {
     for (const k of Object.keys(effectsOf(idx[rid]))) {
       if (!setters[k]) setters[k] = new Set<string>();
@@ -746,7 +816,7 @@ export function derive(records: FoldRecord[]): DeriveOutput {
       })[0];
     }
 
-    state[k] = effectsOf(idx[winner])[k];
+    setOwn(state, k, effectsOf(idx[winner])[k]);
     const distinct = new Set<string>();
     for (const c of cands) distinct.add(pyValueKey(effectsOf(idx[c])[k]));
     if (distinct.size >= 2) {
@@ -929,7 +999,7 @@ export function checkpointRoot(
   const idx = indexRecords([...records]);
   const members = frontierMembers(at);
   if (members === null) return null;
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   const closure = closureIdsMulti(members, idx, parents);
   if (closure === null) return null;
@@ -985,7 +1055,7 @@ export function verifyCheckpoint(
   if (members === null) return v2 ? "MISMATCH" : false;
 
   const idx = indexRecords([...records]);
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   const closure = closureIdsMulti(members, idx, parents);
   let stateOk = false;
@@ -1029,7 +1099,7 @@ export function buildCheckpoint(
   const idx = indexRecords([...records]);
   const atId = String(at);
   if (!Object.prototype.hasOwnProperty.call(idx, atId)) return null;
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   const closure = closureIds(atId, idx, parents);
   if (closure === null) return null;
@@ -1069,7 +1139,7 @@ export function buildFrontierCheckpoint(
   frontierIds?: string[],
 ): Checkpoint | null {
   const idx = indexRecords([...records]);
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   let members: string[];
   if (frontierIds === undefined) {
@@ -1148,7 +1218,7 @@ export function deriveDelta(
   // The stored closure must be exactly the members' ancestor closure within
   // itself.
   const idx = indexRecords([...closure]);
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   const cl = closureIdsMulti(members, idx, parents);
   if (cl === null) return null;
@@ -1200,7 +1270,7 @@ export function witnessFreshnessLegacy(records: FoldRecord[]): { [id: string]: n
   const idx = indexRecords([...records]);
   const out = derive(records);
   const applied = new Set<string>(out.order);
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
 
   const ancestorsIncl = (start: string): Set<string> => {
@@ -1219,7 +1289,7 @@ export function witnessFreshnessLegacy(records: FoldRecord[]): { [id: string]: n
   const result: { [id: string]: number } = {};
   for (const rid of out.order) {
     const kind = (idx[rid] as { kind?: unknown }).kind;
-    if (kind === "witness") result[rid] = total - ancestorsIncl(rid).size;
+    if (kind === "witness") setOwn(result, rid, total - ancestorsIncl(rid).size);
   }
   return result;
 }
@@ -1235,7 +1305,7 @@ export function witnessFreshnessLegacy(records: FoldRecord[]): { [id: string]: n
 export function witnessFreshness(records: FoldRecord[]): { [id: string]: number } {
   const idx = indexRecords([...records]);
   const out = derive(records);
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   const anc = buildAncestry(out.order, parents, idx);
 
@@ -1244,7 +1314,7 @@ export function witnessFreshness(records: FoldRecord[]): { [id: string]: number 
   for (const rid of out.order) {
     const kind = (idx[rid] as { kind?: unknown }).kind;
     if (kind === "witness") {
-      result[rid] = total - (rowPopcount(anc, anc.pos.get(rid) as number) + 1);
+      setOwn(result, rid, total - (rowPopcount(anc, anc.pos.get(rid) as number) + 1));
     }
   }
   return result;
