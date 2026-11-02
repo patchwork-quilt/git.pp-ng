@@ -79,7 +79,7 @@ leaf  = SHA-256( UTF-8(canon) )                    # lowercase hex
   - an **integral** value with `|v| < 1e21` → its **exact** integer digits
     (Python `int(v)`; TypeScript `BigInt(v)` — not `String(v)`, whose shortest
     round-trip diverges from the exact integer for integral doubles in
-    `[1e16, 1e21)`, e.g. `724818294626474393600`, not `…400000`);
+    `[1e16, 1e21)`, e.g. `724818294626474655744`, not `…400000`);
   - signed zero (`-0.0`) → `0`;
   - every other finite value → Python's `repr`/`json.dumps` float form
     (shortest round-trip digits; scientific with a sign-prefixed, ≥2-digit
@@ -201,3 +201,15 @@ differs from the pinned one, not *how*. A root alone cannot distinguish a
 size or its full id set — alongside it, so verification can compare shapes and
 not just a single digest. Until that is specified, `STATE-ONLY` is the only
 answer the root can honestly give for "the closure is not the one I pinned."
+
+## Addendum: frontier checkpoints (set-form `at`)
+
+`at` generalises from one record id to a **set** of ids — the frontier —
+with the root computed by the identical construction over the union of the
+members' closures: [`FRONTIER-CHECKPOINTS.md`](FRONTIER-CHECKPOINTS.md).
+Singleton equivalence is byte-exact (a frontier of one *is* the v2
+checkpoint at that record; writers emit the string form when |F| = 1), the
+verdict semantics above carry over member-wise, and for the auto frontier
+(maximal applied records) the covered set is exactly derive's applied set.
+Fold level only, like this doc's original landing; Worker/runner wiring is
+a separate step.

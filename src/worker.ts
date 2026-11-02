@@ -16,7 +16,10 @@
  */
 import {
   derive,
+  deriveDelta,
+  recordLeaf,
   witnessFreshness,
+  type Checkpoint,
   type DeriveOutput,
   type FoldRecord,
 } from "./fold.ts";
@@ -71,10 +74,35 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 // helpers
 // ---------------------------------------------------------------------------
 
-function json(data: unknown, status = 200): Response {
+// Every response this Worker sends is built by json() or html() below —
+// the single response-construction layer — so the baseline security
+// headers (gauntlet M5 salvage: they were verified absent) cannot be
+// missed by any route. `extraHeaders` carries route-specific observability
+// headers (e.g. x-gitpp-derivation) without bypassing that layer.
+function json(
+  data: unknown,
+  status = 200,
+  extraHeaders?: { [k: string]: string },
+): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      ...(extraHeaders ?? {}),
+    },
+  });
+}
+
+function html(body: string, extraHeaders?: { [k: string]: string }): Response {
+  return new Response(body, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "x-frame-options": "DENY",
+      ...(extraHeaders ?? {}),
+    },
   });
 }
 
@@ -248,20 +276,144 @@ async function mapBounded<T, R>(
 
 interface CollectionWarning {
   id: string;
-  keptFrom: string | null;
-  droppedFrom: string;
+  // Divergent-duplicate warnings (the original shape): the repo the kept
+  // copy came from and the repo the dropped copy came from.
+  keptFrom?: string | null;
+  droppedFrom?: string;
+  // Format v2 (docs/FORMAT-V2.md): a record whose well-formed born digest
+  // disagrees with its own content — {kind: "digest-mismatch", claimed,
+  // computed}. The record is treated exactly as v1 (degrade-and-warn,
+  // never reject); the fold never sees the claim at all.
+  kind?: "digest-mismatch";
+  claimed?: string;
+  computed?: string;
+}
+
+const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+
+/** Format v2 digest verification (docs/FORMAT-V2.md): if a collected copy
+ * carries a WELL-FORMED born digest, check the claim against the copy's own
+ * content via the TS checkpoint-v2 leaf. Returns a digest-mismatch warning
+ * on disagreement, null otherwise — including when the field is absent
+ * (a v1 record: nothing to verify, nothing to warn) or malformed (not a
+ * claim at all; envelope noise under DESIGN §1, ignored like any other
+ * extra field). Verification is an annotation on collection only: the
+ * record passes through unchanged either way, and no disagreement can
+ * reject it — a lying digest degrades the record to exactly v1 treatment. */
+function digestWarning(rec: FoldRecord): CollectionWarning | null {
+  const claimed = (rec as { digest?: unknown }).digest;
+  if (typeof claimed !== "string" || !DIGEST_RE.test(claimed)) return null;
+  const computed = "sha256:" + recordLeaf(rec);
+  if (claimed === computed) return null;
+  return { id: rec.id, kind: "digest-mismatch", claimed, computed };
+}
+
+// ---------------------------------------------------------------------------
+// checkpoint + tail (delta reads). A project may store a checkpoint.json at the
+// project repo's HEAD: a fold Checkpoint (at / state / closureRoot / closure)
+// plus a cover manifest. On the read path, records already in the checkpoint's
+// closure are served FROM the checkpoint (not re-read); only the TAIL (records
+// outside the closure) is read from Artifacts. The namespace `list` already
+// returns each repo's updatedAt, so a covered TASK repo is skipped with no
+// per-repo call when its updatedAt is unchanged; a covered PROJECT commit is
+// skipped by its immutable commit id. derive() then runs over closure ∪ tail —
+// the full record set — so every response is byte-identical to the full fold,
+// which stays the reference (and the silent fallback for any doubt).
+//
+// `at` is either a single record id (string form) or the FRONTIER array form
+// (docs/FRONTIER-CHECKPOINTS.md): the maximal applied records, whose covered
+// set is the union of their ancestor closures — for an auto-computed frontier
+// exactly the whole applied set. The collection below never inspects `at`: it
+// serves records from checkpoint.closure via the cover manifest, which the
+// runner built from the covered set however it was chosen, so collection is
+// closure-agnostic; only deriveDelta (which re-verifies root + state over the
+// stored closure) interprets `at`, and PR 1 taught it both forms.
+// ---------------------------------------------------------------------------
+
+interface StoredCheckpoint extends Checkpoint {
+  // project-repo commit id -> the record id that commit contributed to the
+  // closure. Commit ids are immutable, so a match is a sound skip.
+  coverProjectCommits?: { [commitId: string]: string };
+  // task repo name -> { updatedAt at checkpoint time, the record id in the
+  // closure }. A task repo is skipped only while its CURRENT updatedAt matches.
+  coverTaskRepos?: { [repo: string]: { updatedAt?: string | null; id: string } };
+}
+
+function repoUpdatedAt(meta: RepoMeta): string | null {
+  const v = (meta as { updatedAt?: unknown }).updatedAt;
+  return typeof v === "string" ? v : null;
+}
+
+// A checkpoint's `at` is structurally either the string form (one record id)
+// or the frontier array form: a non-empty array of DISTINCT string ids
+// (docs/FRONTIER-CHECKPOINTS.md). Writers emit the string form whenever the
+// frontier has one member, so files the runner produces carry the array form
+// only for |F| >= 2; the reader accepts any non-empty duplicate-free array —
+// a one-member array is the one-member special case and deriveDelta verifies
+// it exactly like the string form. Anything else (empty array, duplicate or
+// non-string members, a non-string scalar) is malformed: no checkpoint, the
+// full fold runs. This mirrors the fold's frontierMembers rejection set, so
+// the read path fails safe the same way at every layer.
+function checkpointAtOk(at: unknown): boolean {
+  if (typeof at === "string") return true;
+  if (!Array.isArray(at) || at.length === 0) return false;
+  const seen = new Set<string>();
+  for (const m of at) {
+    if (typeof m !== "string" || seen.has(m)) return false;
+    seen.add(m);
+  }
+  return true;
+}
+
+async function readCheckpoint(
+  repo: ArtifactsRepo,
+): Promise<StoredCheckpoint | null> {
+  let parsed: unknown;
+  try {
+    const b = await repo.readFile({ ref: "main", path: "checkpoint.json" });
+    if (!b) return null;
+    parsed = JSON.parse(await b.text());
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const c = parsed as { [k: string]: unknown };
+  if (
+    !checkpointAtOk(c.at) ||
+    typeof c.closureRoot !== "string" ||
+    typeof c.state !== "object" ||
+    c.state === null ||
+    Array.isArray(c.state) ||
+    !Array.isArray(c.closure)
+  ) {
+    return null;
+  }
+  return parsed as StoredCheckpoint;
+}
+
+interface Collection {
+  records: FoldRecord[];
+  repos: string[];
+  origin: Map<string, string>;
+  warnings: CollectionWarning[];
+  // Records collected from outside the checkpoint's closure (the freshly-read
+  // tail). Only meaningful when a checkpoint drove the collection.
+  tail: FoldRecord[];
+  // Whether every covered repo/commit the checkpoint named was present and
+  // unchanged, so the cache was safe to use. False forces the full fallback.
+  coverIntact: boolean;
 }
 
 async function collectProject(
   env: Env,
   project: string,
-): Promise<{
-  records: FoldRecord[];
-  repos: string[];
-  origin: Map<string, string>;
-  warnings: CollectionWarning[];
-}> {
+  checkpoint?: StoredCheckpoint | null,
+): Promise<Collection> {
   const all = await listAllRepos(env);
+  const updatedAt = new Map<string, string | null>();
+  for (const r of all) {
+    if (typeof r.name === "string") updatedAt.set(r.name, repoUpdatedAt(r));
+  }
   const names = all
     .map((r) => r.name)
     .filter(
@@ -270,14 +422,31 @@ async function collectProject(
     )
     .sort();
 
-  // Ordered read plan: project-repo commits first (in deterministic log order),
-  // then task repos in sorted name order. Each entry reads one record.json to
-  // text, catching everything so a failed read becomes null (skipped), exactly
-  // as the sequential version skipped a throw or a null blob.
-  const plan: { repo: string; read: () => Promise<string | null> }[] = [];
+  // Index the checkpoint's closure records by id for cache lookups.
+  const closureById = new Map<string, FoldRecord>();
+  if (checkpoint) {
+    for (const r of checkpoint.closure) {
+      const id = (r as { id?: unknown }).id;
+      if (typeof id === "string") closureById.set(id, r);
+    }
+  }
+  // Every covered repo/commit must still be present and (for task repos)
+  // unchanged, or the cache no longer reflects reality — force full fallback.
+  let coverIntact = true;
 
-  // Project repo: enumerate commits first (one get + one log — sequential, as
-  // the reads below depend on the commit list).
+  // Ordered read plan: project-repo commits first (deterministic log order),
+  // then task repos in sorted name order — exactly the full collection's order,
+  // so dedupe ("first-seen wins"), origin attribution and warnings are
+  // byte-identical whether an entry is read or served from the checkpoint.
+  // `cache` holds record.json text served from the checkpoint (no network);
+  // `tail` marks an entry read fresh (outside the closure).
+  const plan: {
+    repo: string;
+    cache: string | null;
+    read: () => Promise<string | null>;
+    tail: boolean;
+  }[] = [];
+
   try {
     const repo = await env.ARTIFACTS.get(project);
     let commits: string[] = [];
@@ -288,8 +457,13 @@ async function collectProject(
     }
     if (commits.length === 0) commits = ["main"];
     for (const c of commits) {
+      const coveredId = checkpoint?.coverProjectCommits?.[c];
+      const cachedRec = coveredId ? closureById.get(coveredId) : undefined;
+      const cache = cachedRec ? JSON.stringify(cachedRec) : null;
       plan.push({
         repo: project,
+        cache,
+        tail: cache === null,
         read: async () => {
           try {
             const b = await repo.readFile({ ref: c, path: "record.json" });
@@ -304,11 +478,23 @@ async function collectProject(
     /* project repo missing/unready — derive over what exists */
   }
 
-  // Task repos: the task's record at HEAD.
   for (const name of names) {
     if (name === project) continue;
+    const cover = checkpoint?.coverTaskRepos?.[name];
+    const cachedRec = cover ? closureById.get(cover.id) : undefined;
+    // Serve from the checkpoint only when the record is in the closure AND the
+    // repo's updatedAt is unchanged since the checkpoint was taken.
+    const unchanged =
+      cover !== undefined &&
+      cachedRec !== undefined &&
+      cover.updatedAt != null &&
+      updatedAt.get(name) != null &&
+      updatedAt.get(name) === cover.updatedAt;
+    const cache = unchanged ? JSON.stringify(cachedRec) : null;
     plan.push({
       repo: name,
+      cache,
+      tail: cache === null,
       read: async () => {
         try {
           const repo = await env.ARTIFACTS.get(name);
@@ -321,20 +507,23 @@ async function collectProject(
     });
   }
 
-  // Fetch concurrently (results stay index-aligned), then ingest IN ORDER.
-  const texts = await mapBounded(plan, COLLECT_CONCURRENCY, (p) => p.read());
+  // Read only the uncovered (tail) entries; covered entries use their cache.
+  const texts = await mapBounded(plan, COLLECT_CONCURRENCY, (p) =>
+    p.cache !== null ? Promise.resolve(p.cache) : p.read(),
+  );
 
   const byId = new Map<string, FoldRecord>();
-  // record id -> the repo the record was first collected from. First-seen
-  // wins, exactly as the dedupe below does, so the project repo (ingested
-  // first) is credited for records that also appear at a task HEAD.
   const origin = new Map<string, string>();
-  // Normalized JSON of the kept record per id, to tell a harmless duplicate
-  // (the same record seen in the project repo AND at a task HEAD) from a
-  // genuine divergent duplicate (same id, different content across repos),
-  // which is the one case where this first-seen dedupe silently drops data.
   const keptNorm = new Map<string, string>();
   const warnings: CollectionWarning[] = [];
+  const tail: FoldRecord[] = [];
+  // Closure record ids actually served from the checkpoint cache (i.e. whose
+  // source repo/commit is still present). If this does not cover the whole
+  // closure, some covered record's source vanished since the checkpoint — the
+  // reconstruction would then carry a record reality no longer has, so we fall
+  // back. (A covered task repo whose content CHANGED is caught separately:
+  // it is re-read as tail and deriveDelta rejects the tail/closure id clash.)
+  const servedFromCache = new Set<string>();
   for (let i = 0; i < plan.length; i++) {
     const text = texts[i];
     if (text === null) continue;
@@ -342,18 +531,31 @@ async function collectProject(
     try {
       rec = JSON.parse(text) as FoldRecord;
     } catch {
-      /* not JSON a JS reader accepts — skip (see ENGINEERING.md collection audit) */
       continue;
     }
     if (!rec || typeof rec.id !== "string") continue;
-    const norm = JSON.stringify(rec);
+    if (plan[i].tail) tail.push(rec);
+    else servedFromCache.add(rec.id);
+    // Format v2: every collected copy's born-digest claim is verified
+    // against its own content — kept and dropped copies alike, since a
+    // dropped copy's lie is still a fact about the record worth surfacing.
+    const dw = digestWarning(rec);
+    if (dw) warnings.push(dw);
+    // Divergence is judged on content with the digest claim set aside: a
+    // digest is a claim ABOUT the record, not part of what the record
+    // says, so two copies differing only in `digest` have not diverged —
+    // the wrong one earns a digest-mismatch warning above, never a
+    // divergent-duplicate warning here. ("Digests match" must also never
+    // stand in for "contents match": the comparison below is over the
+    // full remaining content, digest or no digest.)
+    const contentRec: FoldRecord = { ...rec };
+    delete contentRec.digest;
+    const norm = JSON.stringify(contentRec);
     if (!byId.has(rec.id)) {
       byId.set(rec.id, rec);
       origin.set(rec.id, plan[i].repo);
       keptNorm.set(rec.id, norm);
     } else if (keptNorm.get(rec.id) !== norm) {
-      // Divergent duplicate: a record with this id, but different content, was
-      // dropped by first-seen dedupe. Surfaced rather than lost silently.
       warnings.push({
         id: rec.id,
         keptFrom: origin.get(rec.id) ?? null,
@@ -362,7 +564,16 @@ async function collectProject(
     }
   }
 
-  return { records: [...byId.values()], repos: names, origin, warnings };
+  if (checkpoint) {
+    for (const id of closureById.keys()) {
+      if (!servedFromCache.has(id)) {
+        coverIntact = false; // a covered record's source vanished/changed
+        break;
+      }
+    }
+  }
+
+  return { records: [...byId.values()], repos: names, origin, warnings, tail, coverIntact };
 }
 
 async function projectDerivation(
@@ -375,15 +586,49 @@ async function projectDerivation(
   repos: string[];
   origin: Map<string, string>;
   warnings: CollectionWarning[];
+  derivedVia: "delta" | "full";
 }> {
-  const { records, repos, origin, warnings } = await collectProject(env, project);
+  // Read the project's checkpoint (if any) once, from the project repo HEAD.
+  let checkpoint: StoredCheckpoint | null = null;
+  try {
+    const repo = await env.ARTIFACTS.get(project);
+    checkpoint = await readCheckpoint(repo);
+  } catch {
+    checkpoint = null;
+  }
+
+  if (checkpoint) {
+    const col = await collectProject(env, project, checkpoint);
+    // Delta derivation: derive(closure ∪ tail). deriveDelta re-verifies the
+    // checkpoint (closure-root recompute, VERIFIED state, closure completeness,
+    // tail/closure disjointness) and returns null on ANY doubt — then we fall
+    // back to the full fold below, which re-reads everything.
+    if (col.coverIntact) {
+      const out = deriveDelta(checkpoint, col.tail);
+      if (out !== null) {
+        return {
+          out,
+          records: col.records,
+          recordCount: col.records.length,
+          repos: col.repos,
+          origin: col.origin,
+          warnings: col.warnings,
+          derivedVia: "delta",
+        };
+      }
+    }
+  }
+
+  // Full fold: the reference path. No checkpoint, or any doubt about one.
+  const col = await collectProject(env, project, null);
   return {
-    out: derive(records),
-    records,
-    recordCount: records.length,
-    repos,
-    origin,
-    warnings,
+    out: derive(col.records),
+    records: col.records,
+    recordCount: col.records.length,
+    repos: col.repos,
+    origin: col.origin,
+    warnings: col.warnings,
+    derivedVia: "full",
   };
 }
 
@@ -402,6 +647,11 @@ interface RecordView {
   parents: unknown;
   effects: unknown;
   reason: unknown;
+  // Format v2: the record's born digest, passed through unchanged when the
+  // record carries one, so an API consumer can verify the record itself
+  // without trusting this Worker. Absent on v1 records (the key serialises
+  // away), so v1 views are byte-identical to before.
+  digest: unknown;
   orphan: boolean;
   // Per-witness staleness from witnessFreshness(): record-position distance
   // between the witness's causal past and the applied frontier. A number on
@@ -445,6 +695,7 @@ function buildRecordsView(
       parents: rec.parents ?? [],
       effects: rec.effects ?? {},
       reason: rec.reason,
+      digest: rec.digest,
       orphan: orphanSet.has(id),
       recordsBehind: Object.prototype.hasOwnProperty.call(freshness, id)
         ? freshness[id]
@@ -594,8 +845,10 @@ async function handleState(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const pp = projectParam(url);
   if ("response" in pp) return pp.response;
-  const { out } = await projectDerivation(env, pp.project);
-  return json(out);
+  const { out, derivedVia } = await projectDerivation(env, pp.project);
+  // The JSON body is exactly derive()'s output (byte-identical to the full
+  // fold); how it was derived is surfaced in a header only, for observability.
+  return json(out, 200, { "x-gitpp-derivation": derivedVia });
 }
 
 async function handleRoot(request: Request, env: Env): Promise<Response> {
@@ -603,17 +856,12 @@ async function handleRoot(request: Request, env: Env): Promise<Response> {
   const pp = projectParam(url);
   if ("response" in pp) return pp.response;
   const project = pp.project;
-  const { out, records, recordCount, repos, origin } = await projectDerivation(
-    env,
-    project,
-  );
+  const { out, records, recordCount, repos, origin, derivedVia } =
+    await projectDerivation(env, project);
   const recordsView = buildRecordsView(records, out, origin, witnessFreshness(records));
-  return new Response(
-    renderProjection(project, out, recordCount, repos, recordsView),
-    {
-      headers: { "content-type": "text/html; charset=utf-8" },
-    },
-  );
+  return html(renderProjection(project, out, recordCount, repos, recordsView), {
+    "x-gitpp-derivation": derivedVia,
+  });
 }
 
 async function handleRecords(request: Request, env: Env): Promise<Response> {
@@ -621,18 +869,20 @@ async function handleRecords(request: Request, env: Env): Promise<Response> {
   const pp = projectParam(url);
   if ("response" in pp) return pp.response;
   const project = pp.project;
-  const { out, records, repos, origin, warnings } = await projectDerivation(
-    env,
-    project,
-  );
+  const { out, records, repos, origin, warnings, derivedVia } =
+    await projectDerivation(env, project);
   const view = buildRecordsView(records, out, origin, witnessFreshness(records));
-  return json({
-    project,
-    count: view.length,
-    repos,
-    records: view,
-    collectionWarnings: warnings,
-  });
+  return json(
+    {
+      project,
+      count: view.length,
+      repos,
+      records: view,
+      collectionWarnings: warnings,
+    },
+    200,
+    { "x-gitpp-derivation": derivedVia },
+  );
 }
 
 async function handleListRepos(env: Env): Promise<Response> {

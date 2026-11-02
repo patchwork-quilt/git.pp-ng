@@ -6,6 +6,25 @@ Cases come from: property fixtures over small hand-built DAGs, randomized
 stress generators (seeded), the live record sets (conformance/live-records.json),
 and hand-built edge cases (cycles, duplicate ids, unknown kinds, bool/int value
 collisions, unicode/non-BMP ids, non-JS-safe integers, checkpoint forgery).
+A separate FRONTIER family (set-form checkpoints, docs/FRONTIER-CHECKPOINTS.md)
+is compared and counted apart so the classic totals stay literally unchanged;
+a FORMAT-V2 family (records born with digests, docs/FORMAT-V2.md) is counted
+apart the same way, and additionally sweeps the whole corpus for the
+born-ignored-by-fold law and root-assembly equivalence;
+a LEAF-BAND family (the checkpoint-v2 leaf-number boundary, issue #28) is
+counted apart the same way, compares every record leaf directly across
+ports, and pins its expected leaves and roots as literals computed from
+the referee, so a boundary drift in either port fails against the pins;
+a PROTO-INDEX family (issue #38: "__proto__" as an effect key and as a
+record id, and records with a missing or non-string id) is counted apart
+the same way and pins its derived orphans, state and freshness as
+literals, so the ruling those cases encode binds the referee as well as
+the ports;
+every case in both families also has its auto-frontier checkpoint checked
+(delta == full derive, covered set == applied set, cross-port identical),
+plus tail-dup scenarios over that checkpoint: a tail record identical to a
+covered record is a duplicate serving (delta engages, equals the full
+derive); a divergent copy under a covered id is a re-version (delta None).
 
 The Python referee is the live oracle: expected outputs are computed by running
 fold.py at harness time, never hardcoded. A divergence is a bug in the port, by
@@ -18,10 +37,12 @@ Exit code 0 iff all cases agree exactly (derive outputs compared with
 Python ==; verify_checkpoint booleans compared exactly) and every property
 check passes.
 """
+import hashlib
 import importlib.util
 import itertools
 import json
 import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -433,12 +454,19 @@ CKPT_V2_EXPECTED = {
     "ckpt-v2-reason-tamper": "STATE-ONLY",
 }
 
-# --- SPIKE: retraction (dispute + settlement) ------------------------------
-# Branch-only semantics; see docs/RETRACTION-SPIKE.md. The differential
-# (TS == Python) runs on every case as usual; RET_EXPECTED additionally pins
-# WHICH answer is correct for the bite cases, and the sprinkling block at
-# the end of this section proves an UNSETTLED dispute changes NOTHING over
-# the whole pre-existing corpus: derive() byte-identical, nothing retracted.
+# --- RETRACTION (dispute + settlement) — fold law (Casey's ruling, --------
+# 2026-11-02) ----------------------------------------------------------------
+# Adopted from PR #16 (the retraction spike) WITH the contested amendment:
+# a retraction the target's author neither filed nor settled is marked
+# CONTESTED on the retraction surface, with dispute/settlement provenance
+# — a ratified accusation is never a silent void. See
+# docs/RETRACTION-SPIKE.md for the design record. The differential
+# (TS == Python, full retraction surface included) runs on every case as
+# usual; RET_EXPECTED additionally pins WHICH answer is correct for the
+# bite cases, RET_CONTESTED pins the contested markings, and the
+# sprinkling block at the end of this section proves an UNSETTLED dispute
+# changes NOTHING over the whole pre-existing corpus: derive()
+# byte-identical, nothing retracted, nothing contested.
 
 def D(id, parents, target, reason="filed in error", author=None, effects=None):
     d = {"id": id, "parents": parents, "kind": "dispute",
@@ -482,9 +510,9 @@ add("ret-anon-settlement",
     AB + [D("dsp", ["c"], "c", author="bob"),
           S("stl", ["dsp"], "dsp", "upheld")], ats=["e"])
 # The captain (an override's author) ratifies a THIRD PARTY's dispute
-# against a record its author still stands behind. Mechanics only — the
-# doctrine question (may a ratified accusation stain work its author
-# defends?) is Casey's open call; nothing in the outputs marks the stain.
+# against a record its author still stands behind. The mechanics retract
+# it; Casey's contested amendment (2026-11-02) is what makes the fold SAY
+# so: ret-captain-upheld is pinned CONTESTED in RET_CONTESTED below.
 ABC = AB + [R("ov", ["g"], "override", {"z": 1}, author="cap",
               reason="captain's standing order")]
 add("ret-captain-upheld",
@@ -595,8 +623,8 @@ add("ret-malformed-settlements",
           S("stl-missing", ["dsp"], "ghost-dsp", "upheld", author="amy")],
     ats=["e"])
 # A dispute's own `effects` are void: meta records are never candidates.
-# (The pre-spike fold ranked unknown kinds as witnesses — a dispute
-# carrying {"rogue": 1} would have SET rogue. The spike closes that.)
+# (The pre-retraction fold ranked unknown kinds as witnesses — a dispute
+# carrying {"rogue": 1} would have SET rogue. The law closes that.)
 add("ret-dispute-effects-void",
     AB + [D("dsp", ["c"], "c", author="bob", effects={"rogue": 1, "k": "sneaky"})],
     ats=["e"])
@@ -620,7 +648,7 @@ add("ret-settlement-field-citation",
 # Unattributed sets are dispute-inert: with no author on the target and no
 # attributed override, NO settlement can be authoritative. (This is the
 # backwards-compatibility story for every record set shipped before the
-# spike — including the live projects.)
+# law — including the live projects.)
 add("ret-unattributed-inert",
     [R("g", [], "task", {"k": 0}),
      R("c", ["g"], "task", {"x": "bad"}),
@@ -637,6 +665,33 @@ add("ret-target-is-witness",
      R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
      D("dsp", ["w"], "w", reason="sensor miscalibrated", author="amy"),
      S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["t"])
+# --- The contested amendment (Casey's ruling, 2026-11-02) -------------------
+# An anonymous accuser, ratified by the captain: the record proves the
+# author (amy) neither filed nor settled — contested, disputed_by null.
+add("ret-contested-anon-dispute",
+    ABC + [D("dsp", ["c"], "c"),
+           S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["e"])
+# The author files against her own record; the captain settles upheld.
+# The retraction stands, but it is the author's own accusation — the fold
+# must NOT mark it contested.
+add("ret-author-files-captain-settles",
+    ABC + [D("dsp", ["c"], "c", author="amy"),
+           S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["e"])
+# Two disputes on one target: one the author settled herself (a plain
+# retraction), one a stranger filed and the captain ratified (contested).
+# Only the second may be marked.
+add("ret-contested-two-disputes",
+    ABC + [D("dsp1", ["c"], "c", author="bob"),
+           S("stl1", ["dsp1"], "dsp1", "upheld", author="amy"),
+           D("dsp2", ["c"], "c", author="mallory"),
+           S("stl2", ["dsp2"], "dsp2", "upheld", author="cap")], ats=["e"])
+# Determinism: the same record SET as ret-captain-upheld, listed in
+# reverse order, must produce the identical contested marking — the
+# surface is a pure function of the set, never of its presentation.
+add("ret-contested-shuffled",
+    list(reversed(ABC + [D("dsp", ["c"], "c", author="mallory"),
+                         S("stl", ["dsp"], "dsp", "upheld", author="cap")])),
+    ats=["e"])
 # Checkpoint closures see only the settlements inside them: with the
 # settlement parented into the chain, the closure at x derives the
 # retracted state; with it outside, the closure honestly derives the
@@ -715,6 +770,56 @@ RET_EXPECTED = {
     "ret-unattributed-inert": ({"k": 0, "x": "bad", "z": 1},
                                {"dsp": "open"}, []),
     "ret-target-is-witness": ({"k": 1, "z": 1}, {"dsp": "upheld"}, ["w"]),
+    "ret-contested-anon-dispute": ({"k": "d-val", "z": 1},
+                                   {"dsp": "upheld"}, ["c"]),
+    "ret-author-files-captain-settles": ({"k": "d-val", "z": 1},
+                                         {"dsp": "upheld"}, ["c"]),
+    "ret-contested-two-disputes": ({"k": "d-val", "z": 1},
+                                   {"dsp1": "upheld", "dsp2": "upheld"}, ["c"]),
+    "ret-contested-shuffled": ({"k": "d-val", "z": 1},
+                               {"dsp": "upheld"}, ["c"]),
+}
+
+# Pinned CONTESTED markings (the amendment): a retraction is contested
+# exactly when the target has an author who neither filed the upheld
+# dispute nor authored the ruling settlement. Every other retraction —
+# self-filed, self-settled, or against an unattributed record — must
+# produce NO entry: the fold claims only what the records back up.
+RET_CONTESTED = {
+    "ret-captain-upheld": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    "ret-chain-voiding": [
+        {"record": "c", "dispute": "dsp0", "settlement": "stl0",
+         "disputed_by": "bob", "settled_by": "cap"}],
+    "ret-multiple-disputes-upheld": [
+        {"record": "c", "dispute": "dsp2", "settlement": "stl2",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    "ret-settlement-conflict-upheld": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl-a",
+         "disputed_by": "bob", "settled_by": "cap"}],
+    "ret-target-is-witness": [
+        {"record": "w", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": "amy", "settled_by": "cap"}],
+    "ret-contested-anon-dispute": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": None, "settled_by": "cap"}],
+    "ret-contested-two-disputes": [
+        {"record": "c", "dispute": "dsp2", "settlement": "stl2",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    "ret-contested-shuffled": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    # NOT contested: the author settled it, filed it, or did both; a
+    # settlement authored BY the target's author (the captain retracting
+    # his own override) is likewise the author's own act.
+    "ret-self-upheld": [],
+    "ret-author-files-captain-settles": [],
+    "ret-descendant-stands": [],
+    "ret-domination-through-retracted": [],
+    "ret-settlement-field-citation": [],
+    "ret-target-is-override": [],
+    "ret-open": [],
 }
 
 # --- Sprinkled inertness: EVERY pre-existing case, three ways --------------
@@ -724,8 +829,8 @@ RET_EXPECTED = {
 # no authors, so there is no target author to match and no captain), which
 # is exactly the claim: an unsettled dispute — including one a stranger
 # tried to settle — changes NOTHING. main() asserts referee derive() is
-# byte-identical to the base case and nothing is retracted; the TS
-# differential on the sprinkled cases themselves proves port parity.
+# byte-identical to the base case and nothing is retracted or contested;
+# the TS differential on the sprinkled cases themselves proves parity.
 SPRINKLE_PAIRS = []
 
 
@@ -759,6 +864,611 @@ for _c in _sprinkle_bases:
 for _i in range(25):
     _c = next(c for c in CASES if c["name"] == f"stress-dag{_i}")
     _sprinkle(_c["name"], _c["records"])
+
+
+
+# --- FRONTIER CHECKPOINTS (docs/FRONTIER-CHECKPOINTS.md) -------------------
+# The set-form generalisation of checkpoint v2: `at` may be a LIST of
+# frontier ids pinning the union of their ancestor closures, root computed
+# by the identical construction. These cases form a SEPARATE family so the
+# classic totals stay literally unchanged; the frontier family is compared
+# cross-port and counted on its own line. Independently, main() checks the
+# AUTO frontier checkpoint of EVERY case in both families (delta == full,
+# covered set == applied set, cross-port identical).
+FRONTIER_CASES = []
+
+
+def _f_case(name, records, probes):
+    FRONTIER_CASES.append({"name": name,
+                           "records": [dict(r) for r in records],
+                           "probes": probes})
+
+
+# A wide, shallow DAG — three strands off one genesis, a frontier of three.
+_F = [
+    R("g", [], "task", {"project": "frontier-demo"}),
+    R("a1", ["g"], "task", {"x": 1}),
+    R("ov", ["a1"], "override", {"x": 2}, reason="captain: x is 2 on strand a"),
+    R("a2", ["ov"], "task", {"y": "a"}),
+    R("b1", ["g"], "task", {"z": 1}),
+    R("b2", ["b1"], "task", {"z": 2}),
+    R("w", ["g"], "witness", {"seen": True}),
+]
+_F_MEMBERS = ["a2", "b2", "w"]  # the maximal applied records, code-point order
+_F_ROOT = ref.checkpoint_root([dict(r) for r in _F], _F_MEMBERS)
+_F_STATE = derive([dict(r) for r in _F])["state"]  # C == applied: the full state
+_F_PROBE = {"at": _F_MEMBERS, "state": _F_STATE, "closureRoot": _F_ROOT}
+
+# (a) VERIFIED over the very set; the members are listed UNSORTED in the
+# probe — `at` is a set, its order in the file carries no meaning.
+_f_case("frontier-verified", _F,
+        [{"at": ["b2", "w", "a2"], "state": _F_STATE, "closureRoot": _F_ROOT}])
+# (b) Grown with descendants on top of the frontier: descendants never enter
+# a member's closure, so C, its root, and its derived state are unchanged —
+# still VERIFIED (the normal case for a frontier checkpoint).
+_F_GROWN = _F + [R("a3", ["a2"], "task", {"y": "a3"}),
+                 R("b3", ["b2"], "task", {}),
+                 R("w2", ["w"], "witness", {"seen2": True})]
+_f_case("frontier-growth-verified", _F_GROWN, [dict(_F_PROBE)])
+# (c) A record OUTSIDE C (an orphan beside the covered set) does not move the
+# verdict: verification ranges over C only and never claimed the rest.
+_F_BESIDE = _F + [R("orph", ["ghost"], "task", {"lost": 1})]
+_f_case("frontier-orphan-beside", _F_BESIDE, [dict(_F_PROBE)])
+# (d) A frontier member removed: C cannot be reproduced -> MISMATCH.
+_f_case("frontier-member-removed", [r for r in _F if r["id"] != "b2"],
+        [dict(_F_PROBE)])
+# (e) A covered ancestor removed: a member's closure is incomplete in the
+# presented set -> MISMATCH.
+_f_case("frontier-ancestor-removed", [r for r in _F if r["id"] != "a1"],
+        [dict(_F_PROBE)])
+# (f) A reason-only re-version of a covered record: the whole-record leaf
+# moves, the fold ignores `reason`, derive(C).state is unchanged -> STATE-ONLY.
+_F_REASON = [dict(r, reason="FORGED: a different reason") if r["id"] == "ov"
+             else dict(r) for r in _F]
+_f_case("frontier-reason-only", _F_REASON, [dict(_F_PROBE)])
+# (g) A covered record's effects tampered where the value REACHES the state
+# (b2 wins z): derive(C).state differs -> MISMATCH.
+_F_TAMPER = [dict(r, effects={"z": 999}) if r["id"] == "b2" else dict(r)
+             for r in _F]
+_f_case("frontier-covered-tamper", _F_TAMPER, [dict(_F_PROBE)])
+# (g2) The same tamper on a DOMINATED record (b1's z never reaches the state
+# — b2 supersedes it) is state-invisible: the leaf moves, the fold's answer
+# does not -> STATE-ONLY, exactly like a reason-only re-version.
+_F_DOM = [dict(r, effects={"z": 999}) if r["id"] == "b1" else dict(r)
+          for r in _F]
+_f_case("frontier-dominated-tamper", _F_DOM, [dict(_F_PROBE)])
+# (h) Singleton equivalence at the verify surface: an array of ONE is the
+# string form — same root, same verdicts (VERIFIED here; STATE-ONLY against
+# a forged root). Builder-level equivalence is pinned in main().
+_f_case("frontier-singleton-verified", _Sa,
+        [{"at": ["c"], "state": _state_a, "closureRoot": _root_a}])
+_f_case("frontier-singleton-state-only", _Sa,
+        [{"at": ["c"], "state": _state_a,
+          "closureRoot":
+          "0000000000000000000000000000000000000000000000000000000000000000"}])
+# (i) Malformed arrays are rejected (MISMATCH under a root): empty member
+# list, duplicated members, non-string members.
+_f_case("frontier-malformed-empty", _Sa,
+        [{"at": [], "state": _state_a, "closureRoot": _root_a}])
+_f_case("frontier-malformed-dup", _Sa,
+        [{"at": ["c", "c"], "state": _state_a, "closureRoot": _root_a}])
+_f_case("frontier-malformed-nonstr", _Sa,
+        [{"at": [123], "state": _state_a, "closureRoot": _root_a}])
+# (j) v1 (no closureRoot) with the array form: the plain bool over C.
+_f_case("frontier-v1-array-true", _F,
+        [{"at": _F_MEMBERS, "state": _F_STATE}])
+_f_case("frontier-v1-array-false", _F,
+        [{"at": _F_MEMBERS, "state": {"forged": 1}}])
+# (k) The frozen scale fixture at its true frontier: four members covering
+# 62/62, root pinned literally below (POC_SCALE1_FRONTIER_ROOT) and
+# recomputed from the construction in main().
+_SCALE = _LIVE["poc-scale-1"]
+_f_case("frontier-live-scale", _SCALE,
+        [{"at": ["t40", "t50", "t60", "witness-1"],
+          "state": derive([dict(r) for r in _SCALE])["state"],
+          "closureRoot": ref.checkpoint_root(
+              [dict(r) for r in _SCALE], ["t40", "t50", "t60", "witness-1"])}])
+# The frontier closure root over poc-scale-1's frontier {t40, t50, t60,
+# witness-1}: the union of the four closures is all 62 records.
+POC_SCALE1_FRONTIER_ROOT = \
+    "3a0919f1cee5e312f5913941116ead057d2b7ad8df998a09025157affaad99ac"
+
+# Explicit three-way / bool result pins for the frontier cases (the harness
+# otherwise only proves the two ports AGREE; these pin WHICH answer is
+# correct). Checked in main() against the referee.
+FRONTIER_EXPECTED = {
+    "frontier-verified": "VERIFIED",
+    "frontier-growth-verified": "VERIFIED",
+    "frontier-orphan-beside": "VERIFIED",
+    "frontier-member-removed": "MISMATCH",
+    "frontier-ancestor-removed": "MISMATCH",
+    "frontier-reason-only": "STATE-ONLY",
+    "frontier-covered-tamper": "MISMATCH",
+    "frontier-dominated-tamper": "STATE-ONLY",
+    "frontier-singleton-verified": "VERIFIED",
+    "frontier-singleton-state-only": "STATE-ONLY",
+    "frontier-malformed-empty": "MISMATCH",
+    "frontier-malformed-dup": "MISMATCH",
+    "frontier-malformed-nonstr": "MISMATCH",
+    "frontier-v1-array-true": True,
+    "frontier-v1-array-false": False,
+    "frontier-live-scale": "VERIFIED",
+}
+
+# --- FORMAT V2: records born with digests (docs/FORMAT-V2.md) --------------
+# A record may carry a sibling `digest` field: "sha256:" + the checkpoint-v2
+# record leaf of its content, written at birth by the runner. The field is a
+# claim ABOUT the record, never an input to it: THE FOLD NEVER READS
+# `digest`, so derivation, verdicts, and roots are functions of the five
+# content fields alone. These cases form a SEPARATE family (like FRONTIER)
+# so the classic totals stay literally unchanged; main() additionally runs
+# the family-2 and family-8 sweeps over the WHOLE corpus (every classic and
+# frontier case), and the worker-level pins (warning shape, the §3.3 dup
+# table, degrade-and-warn) live in tests/format-v2.mjs.
+
+FORMAT_V2_CASES = []
+
+
+def _fmt(name, records, probes=()):
+    FORMAT_V2_CASES.append({"name": name,
+                            "records": [dict(r) for r in records],
+                            "probes": list(probes)})
+
+
+def _born(records):
+    """Copies carrying CORRECT born digests, computed by the referee leaf —
+    the same function the runner's writer uses (the dialect is inherited)."""
+    out = []
+    for r in records:
+        r = dict(r)
+        r["digest"] = "sha256:" + ref._record_leaf(r)
+        out.append(r)
+    return out
+
+
+def _born_some(records, ids):
+    """Copies where only the named records carry (correct) born digests."""
+    out = []
+    for r in records:
+        r = dict(r)
+        if r["id"] in ids:
+            r["digest"] = "sha256:" + ref._record_leaf(r)
+        out.append(r)
+    return out
+
+
+def _v2(records, mode, seed=0):
+    """Copies carrying digests of a chosen untrustworthiness."""
+    rng_v = random.Random(seed)
+    out = []
+    for r in records:
+        r = dict(r)
+        if mode == "garbage":        # well-formed hex, wrong for everything
+            r["digest"] = "sha256:" + "0" * 64
+        elif mode == "random-wrong":  # well-formed, wrong per record
+            r["digest"] = "sha256:" + "".join(
+                rng_v.choice("0123456789abcdef") for _ in range(64))
+        elif mode == "malformed":     # not claims at all
+            r["digest"] = rng_v.choice(["garbage", "", "sha256:xyz", 42, None])
+        out.append(r)
+    return out
+
+
+_WELL_FORMED = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _assembled_root(records, at):
+    """Test-only oracle for the design's root assembly: the closure root
+    computed taking each record's leaf from its BORN DIGEST where one is
+    present and well-formed, recomputing otherwise. Production verify never
+    does this — it always recomputes. The sweep in main() proves assembly
+    and recompute agree wherever the digests are honest, and disagree
+    observably where one lies, which is what makes the recompute-only law
+    safe to keep."""
+    idx = ref._index([ref._canonical_record(r) for r in records])
+    if at not in idx:
+        return None
+    parents = {rid: ref._parents(idx[rid]) for rid in idx}
+    closure = ref._closure_ids(at, idx, parents)
+    if closure is None:
+        return None
+    lines = []
+    for rid in sorted(closure):
+        d = idx[rid].get("digest")
+        leaf = (d[len("sha256:"):]
+                if isinstance(d, str) and _WELL_FORMED.match(d)
+                else ref._record_leaf(idx[rid]))
+        lines.append(f"{rid}:{leaf}")
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+# Family 2 (born-ignored-by-fold), cross-port spot entries — the exhaustive
+# sweep over the whole corpus is in main(). Twins included: duplicate-id
+# resolution must follow content alone, with digests attached.
+_fmt("fmt-ignored-garbage-poc", _v2(poc, "garbage"))
+_fmt("fmt-ignored-random-poc", _v2(poc, "random-wrong", seed=7))
+_fmt("fmt-ignored-malformed-base", _v2(base, "malformed", seed=3))
+_fmt("fmt-ignored-garbage-scale", _v2(_LIVE["poc-scale-1"], "garbage"))
+_dupdiff = [R("a", [], "task", {"k": "first", "shared": 1}),
+            R("a", [], "task", {"k": "second", "shared": 2}),
+            R("b", ["a"], "task", {"k": "b"})]
+_fmt("fmt-ignored-twins-garbage", _v2(_dupdiff, "garbage"))
+
+# Family 1 (born-correct): honest v2 probes over born sets — the state and
+# root of the five content fields, reached identically through v2 records.
+_poc_born = _born(poc)
+_fmt("fmt-born-correct-poc", _poc_born,
+     [{"at": "task-c", "state": closure_state(poc, "task-c"),
+       "closureRoot": ref.checkpoint_root(_poc_born, "task-c")}])
+_floats = [R("g", [], "task", {"tiny": 1e-5, "tinier": 2.5e-7, "negzero": -0.0}),
+           R("a", ["g"], "task", {"frac": 1.5}),
+           R("c", ["a"], "witness", {"sci": 1e-100})]
+_fmt("fmt-born-correct-floats", _born(_floats),
+     [{"at": "c", "state": closure_state(_floats, "c"),
+       "closureRoot": ref.checkpoint_root(_born(_floats), "c")}])
+_fmt("fmt-born-correct-twins", _born(_dupdiff))
+_dupnum = [R("a", [], "task", {"k": 10}), R("a", [], "task", {"k": 9}),
+           R("b", ["a"], "task", {"j": 1})]
+_fmt("fmt-born-correct-twins-numeric", _born(_dupnum))
+# The frozen live project, born: the pinned poc-quilt-1@task-c root must
+# not move (family 8's headline pin, at the verify surface).
+_fmt("fmt-born-live-quilt", _born(_LIVE["poc-quilt-1"]),
+     [{"at": "task-c", "state": closure_state(_LIVE["poc-quilt-1"], "task-c"),
+       "closureRoot": POC_QUILT1_TASK_C_ROOT}])
+
+# Family 3 (born-stale): born correct, then content edited without
+# recompute. The checkpoint was pinned over the ORIGINAL set; against the
+# edited set it must answer exactly as it answers the stripped edited set —
+# the digest changes no verdict, because no verdict reads it.
+_stale0 = [R("g", [], "task", {"k": 1}),
+           R("a", ["g"], "task", {"k": 1}),
+           R("c", ["a"], "witness", {})]
+_stale_root = ref.checkpoint_root(_born(_stale0), "c")
+_stale_state = closure_state(_stale0, "c")
+_stale_dom = _born(_stale0)
+_stale_dom[0] = dict(_stale_dom[0], effects={"k": 7})  # fold-invisible edit
+_fmt("fmt-born-stale-dominated", _stale_dom,
+     [{"at": "c", "state": _stale_state, "closureRoot": _stale_root}])
+_stale_vis = _born(_stale0)
+_stale_vis[1] = dict(_stale_vis[1], effects={"k": 9})  # state-visible edit
+_fmt("fmt-born-stale-state", _stale_vis,
+     [{"at": "c", "state": _stale_state, "closureRoot": _stale_root}])
+
+# Family 4 (born-forged) at the fold level — fmt-dup-copied-digest: record
+# x carries a digest copied from record a over different content. Verify
+# recomputes, so the honest checkpoint still verifies VERIFIED and the
+# root equals the stripped set's; the forgery is caught by the assembly
+# oracle in main(), whose assembled root diverges observably.
+_forge = [R("g", [], "task", {"k": 1}),
+          R("a", ["g"], "task", {"k": 2}),
+          R("x", ["g"], "task", {"k": 3})]
+_forge_born = _born(_forge)
+_forged = [dict(r, digest=_forge_born[1]["digest"]) if r["id"] == "x" else r
+           for r in _forge_born]
+_fmt("fmt-dup-copied-digest", _forged,
+     [{"at": "x", "state": closure_state(_forge, "x"),
+       "closureRoot": ref.checkpoint_root(_forged, "x")}])
+
+# Family 5 (mixed v1+v2 closures, both parent directions): a checkpoint
+# taken when only part of the set is v2 verifies VERIFIED, and its root is
+# the root of the all-v1 and all-v2 writings too (pinned in main()).
+_mix_chain = [R("g", [], "task", {"k": 1}),
+              R("p", ["g"], "task", {"k": 2}),
+              R("c", ["p"], "task", {"k": 3}),
+              R("gc", ["c"], "task", {"k": 4})]
+_mix_state = closure_state(_mix_chain, "gc")
+_mix_a = _born_some(_mix_chain, {"g", "p"})       # v2 ancestors, v1 below
+_fmt("fmt-mixed-v2-ancestors", _mix_a,
+     [{"at": "gc", "state": _mix_state,
+       "closureRoot": ref.checkpoint_root(_mix_a, "gc")}])
+_mix_b = _born_some(_mix_chain, {"c", "gc"})      # v1 parent, v2 below
+_fmt("fmt-mixed-v2-descendants", _mix_b,
+     [{"at": "gc", "state": _mix_state,
+       "closureRoot": ref.checkpoint_root(_mix_b, "gc")}])
+_mix_c = _born_some(_mix_chain, {"g", "c"})       # alternating generations
+_fmt("fmt-mixed-alternating", _mix_c,
+     [{"at": "gc", "state": _mix_state,
+       "closureRoot": ref.checkpoint_root(_mix_c, "gc")}])
+
+# Family 7 (twin-naming): two records share an id, each carrying its OWN
+# correct digest. Names follow contents — the root and the derivation are
+# the set's, whichever twin the canonical index keeps — and exchanging the
+# twins' digests (both claims now wrong) moves nothing.
+_twinK = R("twin", [], "task", {"k": "K"})
+_twinL = R("twin", [], "task", {"k": "L"})
+_twinKid = R("kid", ["twin"], "task", {"j": 1})
+_twins_born = _born([_twinK, _twinL, _twinKid])
+_fmt("fmt-twin-naming", _twins_born,
+     [{"at": "kid",
+       "state": closure_state([_twinK, _twinL, _twinKid], "kid"),
+       "closureRoot": ref.checkpoint_root(_twins_born, "kid")}])
+_fmt("fmt-twin-naming-swapped",
+     [dict(_twins_born[0], digest=_twins_born[1]["digest"]),
+      dict(_twins_born[1], digest=_twins_born[0]["digest"]),
+      _twins_born[2]])
+
+# Frontier checkpoints over born records: the array form is as indifferent
+# to the field as everything else.
+_F_born = _born(_F)
+_fmt("fmt-frontier-born", _F_born, [dict(_F_PROBE)])
+
+# Explicit verdict pins for the semantic format-v2 cases (the harness
+# otherwise only proves the two ports AGREE; these pin WHICH answer is
+# correct, and that the stripped writing of the same content answers the
+# same). Checked in main() against the referee.
+FORMAT_V2_EXPECTED = {
+    "fmt-born-correct-poc": "VERIFIED",
+    "fmt-born-correct-floats": "VERIFIED",
+    "fmt-born-live-quilt": "VERIFIED",
+    "fmt-born-stale-dominated": "STATE-ONLY",
+    "fmt-born-stale-state": "MISMATCH",
+    "fmt-dup-copied-digest": "VERIFIED",
+    "fmt-mixed-v2-ancestors": "VERIFIED",
+    "fmt-mixed-v2-descendants": "VERIFIED",
+    "fmt-mixed-alternating": "VERIFIED",
+    "fmt-twin-naming": "VERIFIED",
+    "fmt-frontier-born": "VERIFIED",
+}
+
+# --- LEAF BAND: the checkpoint-v2 leaf-number boundary (issue #28) ---------
+# The leaf spells an integral float64 with |v| < 1e21 as its EXACT integer
+# digits (docs/CHECKPOINT-V2.md; referee _leaf_num; src/fold.ts pyNumber).
+# In Oct 2026 the TS hub drifted to a 1e16 boundary (issue #28, reverted by
+# PR #31) and the shipped corpus could not see it: no case carried a value
+# in the discriminating band [1e16, 1e21) into a compared leaf or root —
+# the FIX 1 comment above says as much of the classic corpus. These cases
+# form a SEPARATE family (like FRONTIER and FORMAT-V2) so the classic
+# totals stay literally unchanged. Every band value rides in a record whose
+# key a descendant then overrides with an ordinary value: the value is
+# dominated out of the derived STATE (a band value in state would expose
+# the unrelated JSON round-trip subtlety the FIX 1 comment names), but
+# the record is applied, so its leaf is pinned by its own closure root,
+# by the tip root, and by the direct leaf comparison in main().
+# Expected leaves and roots are computed from the PYTHON REFEREE and
+# pinned as literals in LEAF_BAND_PINS below: a drift in EITHER port —
+# or in the referee's own rule — fails against the literals.
+
+LEAF_BAND_CASES = []
+
+
+def _lb(name, records, probes=()):
+    LEAF_BAND_CASES.append({"name": name,
+                            "records": [dict(r) for r in records],
+                            "probes": list(probes)})
+
+
+def _lb_case(name, records, at):
+    _lb(name, records,
+        [{"at": at, "state": closure_state(records, at),
+          "closureRoot": ref.checkpoint_root(
+              [dict(r) for r in records], at)}])
+
+
+# The largest integral double below 1e21: the ulp at 1e21 is 2**17.
+_LB_BELOW_1E21 = 1e21 - 131072.0
+
+# One value alone in its own key, dominated by a child's ordinary 42.
+# The first five DISCRIMINATE the boundary (integral, in [1e16, 1e21)):
+# the 1e21 rule spells them as exact digits, a 1e16 rule as repr.
+# -2**53 sits below both boundaries (exact digits under either), and
+# 1e21 / 2.5e21 sit at and above the boundary (repr under either) —
+# controls pinning the band from outside.
+_LB_SINGLES = [
+    ("1e16", 1e16),
+    ("1e18", 1e18),
+    ("7e20", 7.248182946264746e20),
+    ("below-1e21", _LB_BELOW_1E21),
+    ("neg-1e18", -1e18),
+    ("neg-2pow53", -9007199254740992.0),
+    ("1e21", 1e21),
+    ("2p5e21", 2.5e21),
+]
+for _slug, _val in _LB_SINGLES:
+    _recs = [R("g", [], "task", {"v": _val}),
+             R("t", ["g"], "task", {"v": 42})]
+    _lb_case(f"leaf-band-{_slug}", _recs, "t")
+
+# Controls on the repr / zero paths, state-VISIBLE (the child touches a
+# different key): 2.5e-7 keeps Python's zero-padded exponent form, and
+# -0.0 spells "0" in the leaf.
+for _slug, _val in (("ctrl-2p5e-7", 2.5e-7), ("ctrl-negzero", -0.0)):
+    _recs = [R("g", [], "task", {"v": _val}),
+             R("t", ["g"], "task", {"other": 1})]
+    _lb_case(f"leaf-band-{_slug}", _recs, "t")
+
+# Several band values combined in ONE record (and a second), every key
+# dominated by the tip's ordinary values.
+_LB_COMBO = [
+    R("g", [], "task", {"p": 1e16, "q": 1e18,
+                        "r": 7.248182946264746e20, "s": -1e18}),
+    R("h", ["g"], "task", {"u": _LB_BELOW_1E21, "w": -9007199254740992.0}),
+    R("t", ["h"], "task", {"p": 1, "q": 2, "r": 3, "s": 4, "u": 5, "w": 6}),
+]
+_lb_case("leaf-band-combined", _LB_COMBO, "t")
+
+# A multi-record closure mixing band and ordinary values: band records
+# deep in the ancestry, ordinary overrides above them, the two controls
+# state-visible at the tip's closure, a witness on top.
+_LB_MIXED = [
+    R("g0", [], "task", {"base": 1}),
+    R("a", ["g0"], "task", {"v": 1e18}),
+    R("b", ["a"], "task", {"v": 5, "w": 2.5}),
+    R("c", ["b"], "task", {"u": _LB_BELOW_1E21, "tiny": 2.5e-7, "nz": -0.0}),
+    R("d", ["c"], "task", {"u": 9}),
+    R("w1", ["d"], "witness", {"seen": True}),
+]
+_lb("leaf-band-mixed-closure", _LB_MIXED,
+    [{"at": at, "state": closure_state(_LB_MIXED, at),
+      "closureRoot": ref.checkpoint_root(
+          [dict(r) for r in _LB_MIXED], at)}
+     for at in ("d", "w1")])
+
+# Every leaf-band probe is an honest checkpoint over its own set, so the
+# pinned three-way answer is VERIFIED for each case's first probe.
+LEAF_BAND_EXPECTED = {c["name"]: "VERIFIED" for c in LEAF_BAND_CASES}
+
+# Expected leaves (per record id) and closure roots (per probe `at`),
+# computed from the PYTHON REFEREE and pinned as literals. Filled in
+# below; check_leafband_case in main() holds BOTH ports — and the
+# referee itself — to these literals.
+LEAF_BAND_PINS = {
+    'leaf-band-1e16': {
+        "leaves": {
+            'g':
+                "e5b2a2fc66b13b19da6ec5c82c9c897079c1537ea5e5acca2badf04da1ae81ee",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "83b0c91d22eca7c7bc5c9dd28fa5bd8423d60df7341453894bb9c021ee90e14d",
+        },
+    },
+    'leaf-band-1e18': {
+        "leaves": {
+            'g':
+                "749957718242ce0a6de667a00eec8fdfa2f0f065110e44a6564f23d559b5ac1c",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "3e61a46ce5917b022bd8fee06f2bc2995db25be2887e608af304c5174b7d2117",
+        },
+    },
+    'leaf-band-7e20': {
+        "leaves": {
+            'g':
+                "501942769a223b0670bccd282b51a226c89aa67200876c62ba27d025cad052b9",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "ddc80948cc000dbd417d316f51a63da9328b59873c49a82bb6f46d2c030d2acf",
+        },
+    },
+    'leaf-band-below-1e21': {
+        "leaves": {
+            'g':
+                "b7e2e7b79a66b7416fb07b8907658ada950382f1fcd9d542e6f09babb0c691be",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "7e2c9018889f51a8d394fe8b8ce9895bdc7aacb9207a56d7ba613b11eff19e28",
+        },
+    },
+    'leaf-band-neg-1e18': {
+        "leaves": {
+            'g':
+                "c13d983f3f33bbda456fc10ebc7cddc1559482a4eca0cc30a97595675e5276f5",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "e7b7b67a9d7bcbd773d7c0d6c7882a655ebd5ac3319ac40a4b6a3c2cec26ba95",
+        },
+    },
+    'leaf-band-neg-2pow53': {
+        "leaves": {
+            'g':
+                "8982f3ec450044a671b206f5851c8f716ace5aae95332951b07f211c7730dff9",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "89703f13289ac20f247c0399005099491de2e298cedd7dc109e4e9b7fa17debc",
+        },
+    },
+    'leaf-band-1e21': {
+        "leaves": {
+            'g':
+                "5d5c7ca2e7504d05a28a2839ab307195fa1616bfb9d2ab58b60f66ddc3edacab",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "f27234d3496973dcdc0bd90d01b37bf633b67bfd0a93b5beb1aa3b9724df833b",
+        },
+    },
+    'leaf-band-2p5e21': {
+        "leaves": {
+            'g':
+                "01262be8dbb233de24c06c39538365774533fa45e410dd391edbc429dc4acd3a",
+            't':
+                "6f20944cb9da9c6f4f793867d84ea20a63835bd1c0286c06f0e1e6a60dc44997",
+        },
+        "roots": {
+            't':
+                "cc7bedc7938dae01bfd075decab7177b81909a18d8efc06c9368d248b07fc9db",
+        },
+    },
+    'leaf-band-ctrl-2p5e-7': {
+        "leaves": {
+            'g':
+                "3e42dd20b251410b4ed92bf00e6ab8b7efd272c07481fe8ed52a96236395853d",
+            't':
+                "14ff2aad144c4c29b07172d62d183adc92689ef4473987b43f81c0516783f512",
+        },
+        "roots": {
+            't':
+                "bfa9d2cf1a0adf42062b99746830a369327efa6b236102705f61476a2dd3112c",
+        },
+    },
+    'leaf-band-ctrl-negzero': {
+        "leaves": {
+            'g':
+                "75926594e5931a7cabd2f3bf07446bc0292589b858cb0adc13c278a40193cecc",
+            't':
+                "14ff2aad144c4c29b07172d62d183adc92689ef4473987b43f81c0516783f512",
+        },
+        "roots": {
+            't':
+                "a30eacf1e9e913fc3b5465806282150b43cd70cc18068c1cf9a06b0b71bb7e31",
+        },
+    },
+    'leaf-band-combined': {
+        "leaves": {
+            'g':
+                "1fe8417da1c44aaefacf2ba68b9b1b7fd283986ed73f2ebef6f6f39036261ddf",
+            'h':
+                "8bf5470633ff99d9944b8164b89e6279a14749c23d138cc04b3b2fa21f8696f4",
+            't':
+                "b07ab810319a2da06b2535656ca6d92cf08180284c35326e4875a0df66e85b9b",
+        },
+        "roots": {
+            't':
+                "ad646f74708254337df1a952cecb8dd8052f255f180c8e75fa50e180618072b7",
+        },
+    },
+    'leaf-band-mixed-closure': {
+        "leaves": {
+            'g0':
+                "7868102b2fe38a332c7f74c9198351fb5d428e89922d52a7f54d060c069344c8",
+            'a':
+                "c49811aa37d69ac8e9917c38e10892d8ec298704db0cd56dc7b7676ee1c7513d",
+            'b':
+                "cb57efd1ea7713fe33f60feaebe8c0dbac560d65bcf8da931aec07785e004308",
+            'c':
+                "298653fdbe6a3fba360f7c3068164ecd4053c186bca814dce8531b3e4becf12e",
+            'd':
+                "36987dc4d85af7777f04d81ab3052542fd49bc13a54a54bde98523b6828c7610",
+            'w1':
+                "c1787a9031acd1a457219a92b0e4e17b231ce1b374224ddd04e749ee87605f6a",
+        },
+        "roots": {
+            'd':
+                "96ee933f3ca4e95e89028aa71c6fd2271549d978635aa1d2e51a42d5d034798c",
+            'w1':
+                "5b0133688c8b2ee725cab2a106bb439d7477084abcf6cea41dbe6b73ac9067d0",
+        },
+    },
+}
 
 
 def _ancestors(start, parents, restrict=None):
@@ -890,6 +1600,132 @@ def live_golden():
     return checks
 
 
+# --- PROTO-INDEX family (issue #38): "__proto__" as an effect key, as a
+# record id, and records whose id is missing or not a string. The fold
+# indexed records, effects and setters into plain JS objects, where
+# "__proto__" is a prototype write rather than an entry: an effect key
+# "__proto__" vanished from derived state, a record with id "__proto__"
+# vanished from the index (orphaning its children), id-less records
+# collided on one slot and all but the last were silently dropped, and
+# a numeric id was String()-coerced into collision with the same digits
+# as a string id. The referee handled "__proto__" natively (Python
+# dicts) but RAISED KeyError on a missing id — the behaviour there was
+# undefined, not merely divergent. DESIGN §1 defines a record as
+# carrying a string `id` and is silent on a record without one; the
+# ruling pinned by this family: "__proto__" keys and ids are ordinary
+# entries, and a record whose id is missing or not a string is indexed
+# under a placeholder "missing-id:<sha256 of its canonical content
+# minus the id field>" and held an orphan — never referenced, never
+# applied, never merged with another id-less record (identical contents
+# are the same record served twice and share one placeholder). A
+# SEPARATE family, counted apart like LEAF-BAND so the classic totals
+# stay literally unchanged; the derived orphans/state/freshness of every
+# case are pinned as literals below (computed from the referee), so the
+# pins bind BOTH ports AND the referee to the ruling — cross-port
+# agreement alone would let a shared wrong semantics (like the old
+# 42/"42" coercion, on which both ports agreed) pass silently.
+
+PROTO_INDEX_CASES = []
+
+
+def _pi(name, records, ats=()):
+    recs = [dict(r) for r in records]
+    probes = probes_for(recs, list(ats)) if ats else []
+    PROTO_INDEX_CASES.append({"name": name, "records": recs,
+                              "probes": probes})
+
+
+_pi("proto-effect-key", [
+    R("g", [], "task", {"__proto__": 7, "normal": 1}),
+    R("u", ["g"], "override", {"__proto__": 9},
+      reason="the proto key, contested and won"),
+    R("t", ["g"], "task", {"other": 2}),
+], ats=["u", "t"])
+
+_pi("proto-id", [
+    R("__proto__", [], "task", {"x": 1}),
+    R("kid", ["__proto__"], "task", {"y": 2}),
+    R("kid2", ["kid"], "override", {"x": 3},
+      reason="a descendant override through the proto record"),
+], ats=["kid2"])
+
+_pi("proto-witness", [
+    R("base", [], "task", {"a": 1}),
+    R("__proto__", ["base"], "witness", {"seen": True}),
+], ats=["base"])
+
+_pi("proto-combined", [
+    R("__proto__", [], "task", {"__proto__": {"nested": True}, "plain": 0}),
+    R("kid", ["__proto__"], "task", {"via": 1}),
+    R("u", ["kid"], "override", {"__proto__": 9},
+      reason="wins the proto key over the proto record"),
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+])
+
+_pi("missing-id-lone", [
+    R("a", [], "task", {"k": 1}),
+    R("b", ["a"], "task", {"k": 2, "m": 5}, reason="wins k"),
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+])
+
+_pi("missing-id-two-distinct", [
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+    {"parents": [], "kind": "task", "effects": {"phantom": 2}},
+    R("real", [], "task", {"solid": 3}),
+])
+
+_pi("missing-id-twins", [
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+    {"parents": [], "kind": "task", "effects": {"ghost": 1}},
+    R("real", [], "task", {"solid": 3}),
+])
+
+_pi("nonstring-ids", [
+    {"id": 42, "parents": [], "kind": "task", "effects": {"fromNum": 1}},
+    {"id": None, "parents": [], "kind": "task", "effects": {"fromNull": 1}},
+    {"id": True, "parents": [], "kind": "task", "effects": {"fromBool": 1}},
+    R("42", [], "task", {"fromStr": 2}),
+    R("s", ["42"], "task", {"after": 1}),
+])
+
+_pi("nonstring-same-content", [
+    {"id": 42, "parents": [], "kind": "task", "effects": {"same": 1}},
+    {"parents": [], "kind": "task", "effects": {"same": 1}},
+    R("real", [], "task", {"solid": 3}),
+])
+
+_PI_GHOST = "missing-id:65677a064ab283d269cd943f7796eded5ecc19e3fb17cae33ba872d39ef5a841"
+_PI_PHANTOM = "missing-id:aa78df5e10a08b98dcafa428cd274a866aaf3488cb8a393cd9016db783c83968"
+
+PROTO_INDEX_PINS = {
+    "proto-effect-key": {
+        "state": {"__proto__": 9, "normal": 1, "other": 2}, "orphans": []},
+    "proto-id": {
+        "state": {"x": 3, "y": 2}, "orphans": []},
+    "proto-witness": {
+        "state": {"a": 1, "seen": True}, "orphans": [],
+        "freshness": {"__proto__": 0}},
+    "proto-combined": {
+        "state": {"__proto__": 9, "plain": 0, "via": 1},
+        "orphans": [_PI_GHOST]},
+    "missing-id-lone": {
+        "state": {"k": 2, "m": 5}, "orphans": [_PI_GHOST]},
+    "missing-id-two-distinct": {
+        "state": {"solid": 3}, "orphans": [_PI_GHOST, _PI_PHANTOM]},
+    "missing-id-twins": {
+        "state": {"solid": 3}, "orphans": [_PI_GHOST]},
+    "nonstring-ids": {
+        "state": {"after": 1, "fromStr": 2},
+        "orphans": [
+            "missing-id:4db1a2ef90f988b899ea3822835be76bbe0ef958fc3862083781d20e636f617e",
+            "missing-id:555ac0dddfb267a2fbc9c55132d243eb72254bc8323648dd99244622061a01f8",
+            "missing-id:8eabf76b7166c230331c9cc563d7b66c85b87161a44d2146236f0493984204d8"]},
+    "nonstring-same-content": {
+        "state": {"solid": 3},
+        "orphans": ["missing-id:9415e1be788fcb5f8c05fe73d4defac689fe0e6b40b8954b070a2a2913eafa6e"]},
+}
+
+
 def main():
     cases_path = HERE / "cases.json"
     results_path = HERE / "results.ts.json"
@@ -897,9 +1733,14 @@ def main():
     # kills the whole TS runner batch at JSON.parse. Fail loudly at
     # construction instead — non-finite numbers are out of the record domain
     # (see DESIGN.md §6).
-    cases_path.write_text(json.dumps(CASES, allow_nan=False))
+    cases_path.write_text(json.dumps(
+        CASES + FRONTIER_CASES + FORMAT_V2_CASES + LEAF_BAND_CASES
+        + PROTO_INDEX_CASES,
+        allow_nan=False))
     print(f"harness: {len(CASES)} cases, "
-          f"{sum(len(c['probes']) for c in CASES)} checkpoint probes")
+          f"{sum(len(c['probes']) for c in CASES)} checkpoint probes "
+          f"+ {len(FRONTIER_CASES)} frontier cases, "
+          f"{sum(len(c['probes']) for c in FRONTIER_CASES)} frontier probes")
 
     proc = subprocess.run(
         ["node", str(HERE / "runner.ts"), str(cases_path), str(results_path)],
@@ -911,7 +1752,10 @@ def main():
 
     ts_results = {r["name"]: r for r in json.loads(results_path.read_text())}
     divergences = []
-    for case in CASES:
+    frontier_deltas = 0
+
+    def check_case(case):
+        nonlocal frontier_deltas
         name = case["name"]
         exp_derive = derive([dict(r) for r in case["records"]])
         # Pass closureRoot through so v2 probes get the three-way result; probes
@@ -924,7 +1768,7 @@ def main():
         got = ts_results.get(name)
         if got is None:
             divergences.append((name, "missing from TS results"))
-            continue
+            return
         if got["derive"] != exp_derive:
             divergences.append((name, "derive differs"))
             for field in ("state", "order", "conflicts", "orphans"):
@@ -938,22 +1782,385 @@ def main():
         if got.get("freshness") != exp_fresh:
             divergences.append(
                 (name, f"freshness differs: py={exp_fresh} ts={got.get('freshness')}"))
-        # SPIKE (retraction): the settlement-pass surface must agree too.
+        # Retraction surface: dispute statuses, the retracted set, and the
+        # contested markings must be identical across ports on EVERY case.
         exp_ret = ref.retraction_status([dict(r) for r in case["records"]])
         if got.get("retraction") != exp_ret:
             divergences.append(
-                (name, f"retraction differs: py={exp_ret} ts={got.get('retraction')}"))
+                (name, f"retraction differs: py={exp_ret} "
+                       f"ts={got.get('retraction')}"))
         # checkpoint v2: every applied id's closure-root digest must be identical
         # across ports (SPIKE).
         exp_roots = {rid: ref.checkpoint_root([dict(r) for r in case["records"]], rid)
                      for rid in exp_derive["order"]}
         if got.get("roots") != exp_roots:
             divergences.append((name, "closure-root digests differ"))
+        # DELTA DERIVATION (checkpoint + tail): at every legal checkpoint
+        # position, delta derivation must (a) equal the FULL derive byte-for-byte
+        # and (b) match the TS port. The full fold is the reference; the delta
+        # path must never diverge from it.
+        exp_deltas = {}
+        for rid in exp_derive["order"]:
+            cp = ref.build_checkpoint([dict(r) for r in case["records"]], rid)
+            if cp is None:
+                exp_deltas[rid] = None
+                continue
+            closure_ids = {r["id"] for r in cp["closure"]}
+            tail = [dict(r) for r in case["records"] if r.get("id") not in closure_ids]
+            d = ref.derive_delta(cp, tail)
+            exp_deltas[rid] = d
+            if d != exp_derive:
+                divergences.append(
+                    (name, f"delta@{rid} != full derive"))
+        if got.get("deltas") != exp_deltas:
+            divergences.append((name, "delta derivation differs across ports"))
+        # FRONTIER DERIVATION: the case's AUTO frontier checkpoint (maximal
+        # applied records) must (a) cover exactly the applied set — the
+        # C == applied-set theorem — with the full derived state pinned,
+        # (b) delta-derive to the FULL derive byte-for-byte, and (c) be
+        # built identically by the TS port (members, root, coverage, delta).
+        fcp = ref.build_frontier_checkpoint([dict(r) for r in case["records"]])
+        got_f = got.get("frontier")
+        if fcp is None:
+            if got_f is not None:
+                divergences.append(
+                    (name, "frontier checkpoint: TS built one, referee none"))
+            return
+        if got_f is None:
+            divergences.append(
+                (name, "frontier checkpoint: referee built one, TS none"))
+            return
+        frontier_deltas += 1
+        if {r["id"] for r in fcp["closure"]} != set(exp_derive["order"]):
+            divergences.append(
+                (name, "frontier covered set != applied set"))
+        if fcp["state"] != exp_derive["state"]:
+            divergences.append(
+                (name, "frontier pinned state != full derived state"))
+        fclosure_ids = {r["id"] for r in fcp["closure"]}
+        ftail = [dict(r) for r in case["records"]
+                 if r.get("id") not in fclosure_ids]
+        exp_fd = ref.derive_delta(fcp, ftail)
+        if exp_fd != exp_derive:
+            divergences.append((name, "frontier delta != full derive"))
+        if (got_f.get("at") != fcp["at"]
+                or got_f.get("closureRoot") != fcp["closureRoot"]
+                or got_f.get("covered") != len(fcp["closure"])
+                or got_f.get("delta") != exp_fd):
+            divergences.append(
+                (name, "frontier checkpoint differs across ports"))
+        # TAIL-DUP (the frontier self-clash): over the same auto-frontier
+        # checkpoint, a tail serving of a COVERED record with identical
+        # content is a duplicate, not a re-version — delta must ENGAGE and
+        # equal the full derive; a divergent copy under the same covered id
+        # must still answer None. (Live shape: a checkpoint commit's tree
+        # inherits the project repo's record.json, the commit is in no
+        # cover, so that record is re-read as tail on every delta read.)
+        _covered0 = fcp["closure"][0]
+        _dup = json.loads(json.dumps(_covered0))
+        _div = json.loads(json.dumps(_covered0))
+        _div["effects"] = {"__taildup__": "divergent"}
+        exp_td = {"dup": ref.derive_delta(fcp, ftail + [_dup]),
+                  "div": ref.derive_delta(fcp, ftail + [_div])}
+        if exp_td["dup"] != exp_derive:
+            divergences.append(
+                (name, "tail-dup: identical duplicate of a covered record "
+                       "!= full derive (referee)"))
+        if exp_td["div"] is not None:
+            divergences.append(
+                (name, "tail-dup: divergent copy of a covered record "
+                       "engaged (referee) — must be None"))
+        if got.get("taildup") != exp_td:
+            divergences.append(
+                (name, "tail-dup scenarios differ across ports"))
+
+    fmt = {"ignored": 0, "verdicts": 0, "assembled": 0, "flipped": 0,
+           "frontier_deltas": 0}
+
+    def check_fmt_case(case):
+        # The full cross-port battery (the same assertions as check_case,
+        # counted on the FORMAT-V2 line only), PLUS the format-v2 law: the
+        # STRIPPED writing of the same content — every digest removed —
+        # derives, verifies, freshens, and roots identically in the
+        # referee. The fold's outputs are a function of the five content
+        # fields alone.
+        name = case["name"]
+        recs = [dict(r) for r in case["records"]]
+        stripped = [{k: v for k, v in r.items() if k != "digest"}
+                    for r in recs]
+        exp_derive = derive(recs)
+        got = ts_results.get(name)
+        if got is None:
+            divergences.append((name, "missing from TS results"))
+            return
+        if got["derive"] != exp_derive:
+            divergences.append((name, "derive differs"))
+        if exp_derive != derive(stripped):
+            divergences.append(
+                (name, "derive(digest-carrying) != derive(stripped)"))
+        exp_verify = [
+            verify(recs, {k: p[k] for k in ("at", "state", "closureRoot")
+                          if k in p})
+            for p in case["probes"]
+        ]
+        if got["verify"] != exp_verify:
+            divergences.append(
+                (name, f"verify differs: py={exp_verify} ts={got['verify']}"))
+        exp_verify_stripped = [
+            verify(stripped, {k: p[k] for k in ("at", "state", "closureRoot")
+                              if k in p})
+            for p in case["probes"]
+        ]
+        if exp_verify != exp_verify_stripped:
+            divergences.append(
+                (name, "verify verdicts moved by the digest field"))
+        exp_fresh = ref.witness_freshness(recs)
+        if got.get("freshness") != exp_fresh:
+            divergences.append((name, "freshness differs across ports"))
+        if exp_fresh != ref.witness_freshness(stripped):
+            divergences.append(
+                (name, "freshness moved by the digest field"))
+        exp_roots = {rid: ref.checkpoint_root(recs, rid)
+                     for rid in exp_derive["order"]}
+        if got.get("roots") != exp_roots:
+            divergences.append((name, "closure-root digests differ"))
+        if exp_roots != {rid: ref.checkpoint_root(stripped, rid)
+                         for rid in exp_derive["order"]}:
+            divergences.append((name, "closure roots moved by digests"))
+        # Delta derivation at every legal checkpoint position, as in
+        # check_case — mixed v1+v2 closures and tails included.
+        exp_deltas = {}
+        for rid in exp_derive["order"]:
+            cp = ref.build_checkpoint(recs, rid)
+            if cp is None:
+                exp_deltas[rid] = None
+                continue
+            closure_ids = {r["id"] for r in cp["closure"]}
+            tail = [dict(r) for r in recs if r.get("id") not in closure_ids]
+            d = ref.derive_delta(cp, tail)
+            exp_deltas[rid] = d
+            if d != exp_derive:
+                divergences.append((name, f"delta@{rid} != full derive"))
+        if got.get("deltas") != exp_deltas:
+            divergences.append((name, "delta derivation differs across ports"))
+        # Auto-frontier checkpoint + tail-dup scenarios, as in check_case.
+        fcp = ref.build_frontier_checkpoint(recs)
+        got_f = got.get("frontier")
+        if fcp is None:
+            if got_f is not None:
+                divergences.append(
+                    (name, "frontier checkpoint: TS built one, referee none"))
+            return
+        if got_f is None:
+            divergences.append(
+                (name, "frontier checkpoint: referee built one, TS none"))
+            return
+        fmt["frontier_deltas"] += 1
+        if {r["id"] for r in fcp["closure"]} != set(exp_derive["order"]):
+            divergences.append((name, "frontier covered set != applied set"))
+        fclosure_ids = {r["id"] for r in fcp["closure"]}
+        ftail = [dict(r) for r in recs if r.get("id") not in fclosure_ids]
+        exp_fd = ref.derive_delta(fcp, ftail)
+        if exp_fd != exp_derive:
+            divergences.append((name, "frontier delta != full derive"))
+        if (got_f.get("at") != fcp["at"]
+                or got_f.get("closureRoot") != fcp["closureRoot"]
+                or got_f.get("covered") != len(fcp["closure"])
+                or got_f.get("delta") != exp_fd):
+            divergences.append(
+                (name, "frontier checkpoint differs across ports"))
+        _covered0 = fcp["closure"][0]
+        _dup = json.loads(json.dumps(_covered0))
+        _div = json.loads(json.dumps(_covered0))
+        _div["effects"] = {"__taildup__": "divergent"}
+        exp_td = {"dup": ref.derive_delta(fcp, ftail + [_dup]),
+                  "div": ref.derive_delta(fcp, ftail + [_div])}
+        if exp_td["dup"] != exp_derive:
+            divergences.append(
+                (name, "tail-dup: identical duplicate != full derive"))
+        if exp_td["div"] is not None:
+            divergences.append(
+                (name, "tail-dup: divergent copy engaged — must be None"))
+        if got.get("taildup") != exp_td:
+            divergences.append((name, "tail-dup scenarios differ across ports"))
+
+    lb = {"leaves": 0, "roots": 0, "frontier_deltas": 0}
+
+    def check_leafband_case(case):
+        # The full cross-port battery (the same assertions as check_case,
+        # counted on the LEAF-BAND line only), PLUS the family's own
+        # point: every record's LEAF compared directly — the TS port's
+        # recordLeaf (emitted by the runner) against the referee's
+        # _record_leaf — and both ports AND the referee held to the
+        # LEAF_BAND_PINS literals, so the boundary rule itself is pinned,
+        # not merely agreed between two ports that could drift together.
+        name = case["name"]
+        recs = [dict(r) for r in case["records"]]
+        exp_derive = derive(recs)
+        got = ts_results.get(name)
+        if got is None:
+            divergences.append((name, "missing from TS results"))
+            return
+        if got["derive"] != exp_derive:
+            divergences.append((name, "derive differs"))
+        exp_leaves = [ref._record_leaf(dict(r)) for r in recs]
+        if got.get("leaves") != exp_leaves:
+            divergences.append((name, "record leaves differ across ports"))
+        lb["leaves"] += len(exp_leaves)
+        pins = LEAF_BAND_PINS.get(name)
+        if pins is not None:
+            _by_id = {r["id"]: i for i, r in enumerate(recs)}
+            _ts_leaves = got.get("leaves") or []
+            for _rid, _lit in pins["leaves"].items():
+                _i = _by_id[_rid]
+                if exp_leaves[_i] != _lit:
+                    divergences.append(
+                        (name, f"referee leaf for {_rid} != pinned literal"))
+                if _i >= len(_ts_leaves) or _ts_leaves[_i] != _lit:
+                    divergences.append(
+                        (name, f"TS leaf for {_rid} != pinned literal"))
+            for _at, _lit in pins["roots"].items():
+                if ref.checkpoint_root([dict(r) for r in recs], _at) != _lit:
+                    divergences.append(
+                        (name, f"referee root @{_at} != pinned literal"))
+                if (got.get("roots") or {}).get(_at) != _lit:
+                    divergences.append(
+                        (name, f"TS root @{_at} != pinned literal"))
+        exp_verify = [
+            verify([dict(r) for r in case["records"]],
+                   {k: p[k] for k in ("at", "state", "closureRoot") if k in p})
+            for p in case["probes"]
+        ]
+        if got["verify"] != exp_verify:
+            divergences.append(
+                (name, f"verify differs: py={exp_verify} ts={got['verify']}"))
+        exp_fresh = ref.witness_freshness(recs)
+        if got.get("freshness") != exp_fresh:
+            divergences.append((name, "freshness differs across ports"))
+        exp_roots = {rid: ref.checkpoint_root(recs, rid)
+                     for rid in exp_derive["order"]}
+        if got.get("roots") != exp_roots:
+            divergences.append((name, "closure-root digests differ"))
+        lb["roots"] += len(exp_roots)
+        # Delta derivation at every legal checkpoint position, as in
+        # check_case.
+        exp_deltas = {}
+        for rid in exp_derive["order"]:
+            cp = ref.build_checkpoint(recs, rid)
+            if cp is None:
+                exp_deltas[rid] = None
+                continue
+            closure_ids = {r["id"] for r in cp["closure"]}
+            tail = [dict(r) for r in case["records"]
+                    if r.get("id") not in closure_ids]
+            d = ref.derive_delta(cp, tail)
+            exp_deltas[rid] = d
+            if d != exp_derive:
+                divergences.append((name, f"delta@{rid} != full derive"))
+        if got.get("deltas") != exp_deltas:
+            divergences.append((name, "delta derivation differs across ports"))
+        # Auto-frontier checkpoint + tail-dup scenarios, as in check_case.
+        fcp = ref.build_frontier_checkpoint(recs)
+        got_f = got.get("frontier")
+        if fcp is None:
+            if got_f is not None:
+                divergences.append(
+                    (name, "frontier checkpoint: TS built one, referee none"))
+            return
+        if got_f is None:
+            divergences.append(
+                (name, "frontier checkpoint: referee built one, TS none"))
+            return
+        lb["frontier_deltas"] += 1
+        if {r["id"] for r in fcp["closure"]} != set(exp_derive["order"]):
+            divergences.append((name, "frontier covered set != applied set"))
+        fclosure_ids = {r["id"] for r in fcp["closure"]}
+        ftail = [dict(r) for r in recs if r.get("id") not in fclosure_ids]
+        exp_fd = ref.derive_delta(fcp, ftail)
+        if exp_fd != exp_derive:
+            divergences.append((name, "frontier delta != full derive"))
+        if (got_f.get("at") != fcp["at"]
+                or got_f.get("closureRoot") != fcp["closureRoot"]
+                or got_f.get("covered") != len(fcp["closure"])
+                or got_f.get("delta") != exp_fd):
+            divergences.append(
+                (name, "frontier checkpoint differs across ports"))
+        _covered0 = fcp["closure"][0]
+        _dup = json.loads(json.dumps(_covered0))
+        _div = json.loads(json.dumps(_covered0))
+        _div["effects"] = {"__taildup__": "divergent"}
+        exp_td = {"dup": ref.derive_delta(fcp, ftail + [_dup]),
+                  "div": ref.derive_delta(fcp, ftail + [_div])}
+        if exp_td["dup"] != exp_derive:
+            divergences.append(
+                (name, "tail-dup: identical duplicate != full derive"))
+        if exp_td["div"] is not None:
+            divergences.append(
+                (name, "tail-dup: divergent copy engaged — must be None"))
+        if got.get("taildup") != exp_td:
+            divergences.append((name, "tail-dup scenarios differ across ports"))
+
+    for case in CASES:
+        check_case(case)
+    for case in FRONTIER_CASES:
+        check_case(case)
+    def check_proto_index_case(case):
+        # The shared battery first (derive, verdict probes, witness
+        # freshness, closure roots, frontier + per-closure deltas,
+        # tail-dups), then the family's own literal pins: the referee AND
+        # the TS port must both produce the pinned orphans/state (and
+        # freshness where pinned) — the pins are the issue-#38 ruling,
+        # stated independently of either implementation.
+        check_case(case)
+        name = case["name"]
+        pins = PROTO_INDEX_PINS[name]
+        exp = derive([dict(r) for r in case["records"]])
+        got = ts_results.get(name)
+        if got is None:
+            divergences.append((name, "missing from TS results"))
+            return
+        for label, out in (("referee", exp), ("ts", got["derive"])):
+            if out["orphans"] != pins["orphans"]:
+                divergences.append(
+                    (name, f"{label} orphans {out['orphans']} != pinned "
+                           f"{pins['orphans']}"))
+            if out["state"] != pins["state"]:
+                divergences.append(
+                    (name, f"{label} state "
+                           f"{json.dumps(out['state'], sort_keys=True)} "
+                           f"!= pinned "
+                           f"{json.dumps(pins['state'], sort_keys=True)}"))
+        if "freshness" in pins:
+            exp_fresh = ref.witness_freshness(
+                [dict(r) for r in case["records"]])
+            if exp_fresh != pins["freshness"]:
+                divergences.append(
+                    (name, f"referee freshness {exp_fresh} != pinned "
+                           f"{pins['freshness']}"))
+            if got["freshness"] != pins["freshness"]:
+                divergences.append(
+                    (name, f"ts freshness {got['freshness']} != pinned "
+                           f"{pins['freshness']}"))
+
+    for case in FORMAT_V2_CASES:
+        check_fmt_case(case)
+    for case in LEAF_BAND_CASES:
+        check_leafband_case(case)
+    for case in PROTO_INDEX_CASES:
+        check_proto_index_case(case)
 
     total_probes = sum(len(c["probes"]) for c in CASES)
     total_witnesses = sum(
         len(ref.witness_freshness([dict(r) for r in c["records"]])) for c in CASES)
     total_roots = sum(len(derive([dict(r) for r in c["records"]])["order"]) for c in CASES)
+    # Legal delta positions = applied ids with a complete closure (a buildable
+    # checkpoint). Each was checked delta==full AND cross-port above.
+    total_deltas = 0
+    for c in CASES:
+        recs = [dict(r) for r in c["records"]]
+        for rid in derive(recs)["order"]:
+            if ref.build_checkpoint([dict(r) for r in c["records"]], rid) is not None:
+                total_deltas += 1
     if divergences:
         print(f"\nDIVERGENCES: {len(divergences)} case(s):")
         for name, why in divergences[:20]:
@@ -987,8 +2194,11 @@ def main():
                            if k in _c["probes"][0]})
             assert _got == _want, \
                 f"{_nm}: expected {_want}, referee gave {_got}"
-        # SPIKE (retraction): pin WHICH answer is correct for the bite
-        # cases — state, dispute statuses, and the retracted set.
+        # RETRACTION (fold law, 2026-11-02): pin WHICH answer is correct
+        # for the bite cases — state, dispute statuses, retracted set —
+        # and pin the CONTESTED markings of the amendment: a retraction
+        # the target's author neither filed nor settled is marked, with
+        # provenance; every other retraction is not.
         for _nm, (_state, _statuses, _retracted) in RET_EXPECTED.items():
             _c = _by_name[_nm]
             _recs = [dict(r) for r in _c["records"]]
@@ -1000,9 +2210,15 @@ def main():
                 f"{_nm}: disputes {_rs['disputes']} != pinned {_statuses}"
             assert _rs["retracted"] == _retracted, \
                 f"{_nm}: retracted {_rs['retracted']} != pinned {_retracted}"
-        # SPIKE (retraction): the sprinkled inertness proof — for every
-        # sprinkled variant of a pre-existing case, the referee's derive()
-        # is byte-identical to the base case's and nothing is retracted.
+        for _nm, _want_contested in RET_CONTESTED.items():
+            _c = _by_name[_nm]
+            _rs = ref.retraction_status([dict(r) for r in _c["records"]])
+            assert _rs["contested"] == _want_contested, \
+                f"{_nm}: contested {_rs['contested']} != pinned " \
+                f"{_want_contested}"
+        # The sprinkled inertness proof: for every sprinkled variant of a
+        # pre-existing case, the referee's derive() is byte-identical to
+        # the base case's and nothing is retracted or contested.
         for _base_nm, _spr_nm in SPRINKLE_PAIRS:
             _b = derive([dict(r) for r in _by_name[_base_nm]["records"]])
             _s = derive([dict(r) for r in _by_name[_spr_nm]["records"]])
@@ -1010,24 +2226,218 @@ def main():
                 f"{_spr_nm}: sprinkled dispute changed derive() vs {_base_nm}"
             _rs = ref.retraction_status(
                 [dict(r) for r in _by_name[_spr_nm]["records"]])
-            assert _rs["retracted"] == [] and \
+            assert _rs["retracted"] == [] and _rs["contested"] == [] and \
                 set(_rs["disputes"].values()) <= {"open"}, \
                 f"{_spr_nm}: sprinkled dispute was not inert: {_rs}"
+        # FRONTIER: pin the frozen poc-scale-1 frontier — four members
+        # covering 62/62, the root literal recomputed from the construction.
+        _scale = [dict(r) for r in _LIVE["poc-scale-1"]]
+        _fcp = ref.build_frontier_checkpoint(_scale)
+        assert _fcp is not None, "poc-scale-1 frontier checkpoint missing"
+        assert _fcp["at"] == ["t40", "t50", "t60", "witness-1"], \
+            f"poc-scale-1 frontier members: {_fcp['at']}"
+        assert len(_fcp["closure"]) == 62, \
+            f"poc-scale-1 frontier covers {len(_fcp['closure'])}, want 62"
+        assert _fcp["closureRoot"] == POC_SCALE1_FRONTIER_ROOT, \
+            f"poc-scale-1 frontier root changed: {_fcp['closureRoot']}"
+        assert ref.checkpoint_root(
+            _scale, ["t40", "t50", "t60",
+                      "witness-1"]) == POC_SCALE1_FRONTIER_ROOT
+        assert _fcp["state"] == derive(_scale)["state"]  # C == applied set
+        # TAIL-DUP incident pin (the live poc-scale-1 shape): the frontier
+        # checkpoint commit's tree inherits witness-1's record.json and that
+        # commit is in no cover manifest, so witness-1 is re-read as tail
+        # on every live delta read. Identical content must ENGAGE and equal
+        # the full derive; a divergent witness-1 must still answer None.
+        _w1 = next(r for r in _scale if r["id"] == "witness-1")
+        assert ref.derive_delta(_fcp, [dict(_w1)]) == derive(_scale), \
+            "tail-dup: identical witness-1 tail != full derive (poc-scale-1)"
+        _w1_div = dict(_w1)
+        _w1_div["effects"] = {"__taildup__": "divergent"}
+        assert ref.derive_delta(_fcp, [_w1_div]) is None, \
+            "tail-dup: divergent witness-1 tail engaged (poc-scale-1)"
+        # FRONTIER verdict pins: the referee gives the PINNED answer for
+        # each semantic frontier case, not only cross-port agreement.
+        _fby_name = {c["name"]: c for c in FRONTIER_CASES}
+        for _nm, _want in FRONTIER_EXPECTED.items():
+            _c = _fby_name[_nm]
+            _got = verify([dict(r) for r in _c["records"]],
+                          {k: _c["probes"][0][k]
+                           for k in ("at", "state", "closureRoot")
+                           if k in _c["probes"][0]})
+            assert _got == _want, \
+                f"{_nm}: expected {_want}, referee gave {_got}"
+        # Singleton equivalence of the builders, over the whole corpus: an
+        # array of one builds EXACTLY the string-form checkpoint object,
+        # and a one-member list digests exactly the singleton root — the
+        # generalisation is a widening of the domain, not a new digest.
+        for _c in CASES:
+            _recs = [dict(r) for r in _c["records"]]
+            for _rid in derive(_recs)["order"]:
+                _single = ref.build_checkpoint([dict(r) for r in _recs], _rid)
+                if _single is None:
+                    continue
+                assert ref.build_frontier_checkpoint(
+                    [dict(r) for r in _recs], [_rid]) == _single, \
+                    f"singleton frontier != build_checkpoint in {_c['name']}@{_rid}"
+                assert ref.checkpoint_root([dict(r) for r in _recs], [_rid]) == \
+                    ref.checkpoint_root([dict(r) for r in _recs], _rid), \
+                    f"one-member root != singleton root in {_c['name']}@{_rid}"
+        # FORMAT V2 verdict pins: the referee gives the PINNED answer for
+        # each semantic format-v2 case.
+        _fmt_by_name = {c["name"]: c for c in FORMAT_V2_CASES}
+        for _nm, _want in FORMAT_V2_EXPECTED.items():
+            _c = _fmt_by_name[_nm]
+            _got = verify([dict(r) for r in _c["records"]],
+                          {k: _c["probes"][0][k]
+                           for k in ("at", "state", "closureRoot")
+                           if k in _c["probes"][0]})
+            assert _got == _want, \
+                f"{_nm}: expected {_want}, referee gave {_got}"
+        # LEAF-BAND verdict pins: the referee gives the PINNED answer for
+        # each leaf-band case (every probe is an honest checkpoint).
+        _lb_by_name = {c["name"]: c for c in LEAF_BAND_CASES}
+        for _nm, _want in LEAF_BAND_EXPECTED.items():
+            _c = _lb_by_name[_nm]
+            _got = verify([dict(r) for r in _c["records"]],
+                          {k: _c["probes"][0][k]
+                           for k in ("at", "state", "closureRoot")
+                           if k in _c["probes"][0]})
+            assert _got == _want, \
+                f"{_nm}: expected {_want}, referee gave {_got}"
+        # FORMAT V2 root pins. (a) The frozen poc-quilt-1@task-c root,
+        # assembled from born digests, is the pinned literal — the root is
+        # a function of content alone, however the leaves are sourced.
+        assert _assembled_root(
+            _born([dict(r) for r in _LIVE["poc-quilt-1"]]),
+            "task-c") == POC_QUILT1_TASK_C_ROOT, \
+            "assembled poc-quilt-1@task-c root != pinned literal"
+        # (b) Mixed closures root identically in all three writings.
+        assert ref.checkpoint_root(_mix_a, "gc") == \
+            ref.checkpoint_root(_mix_chain, "gc") == \
+            ref.checkpoint_root(_born(_mix_chain), "gc"), \
+            "mixed-closure root differs across v1/v2 writings"
+        # (c) Twin-naming: the root follows the content the canonical
+        # index keeps (L — its stripped serialisation sorts after K's),
+        # never the digest either twin carries.
+        assert ref.checkpoint_root(_twins_born, "kid") == \
+            ref.checkpoint_root([_twinL, _twinKid], "kid"), \
+            "twin-naming: root does not follow the content winner"
+        assert ref.checkpoint_root(_twins_born, "kid") != \
+            ref.checkpoint_root([_twinK, _twinKid], "kid"), \
+            "twin-naming: root cannot distinguish the twins"
+        # (d) The copied digest, caught by assembly: over the forged set
+        # the assembled root diverges from the recomputed root — the fast
+        # path can tell a claim was taken on trust, which is exactly why
+        # the shipped verify path never takes one.
+        _forged_recs = [dict(r) for r in _fmt_by_name["fmt-dup-copied-digest"]["records"]]
+        assert _assembled_root(_forged_recs, "x") != \
+            ref.checkpoint_root(_forged_recs, "x"), \
+            "fmt-dup-copied-digest: assembled root must diverge from recomputed"
+        assert _assembled_root(_forged_recs, "x") is not None
+        # FORMAT V2 corpus sweeps, over EVERY classic and frontier case.
+        for _c in CASES + FRONTIER_CASES:
+            _recs = [dict(r) for r in _c["records"]]
+            _want_d = derive(_recs)
+            _want_f = ref.witness_freshness(_recs)
+            # (i) born-ignored-by-fold: garbage digests — uniform and
+            # per-record random — leave derive + freshness byte-identical.
+            for _mode, _seed in (("garbage", 0), ("random-wrong", 11)):
+                _v = _v2(_recs, _mode, seed=_seed)
+                assert derive(_v) == _want_d, \
+                    f"fmt sweep: derive moved under {_mode} digests in {_c['name']}"
+                assert ref.witness_freshness(_v) == _want_f, \
+                    f"fmt sweep: freshness moved under {_mode} digests in {_c['name']}"
+                fmt["ignored"] += 1
+            _born_c = _born(_recs)
+            # (ii) born-correct verdict invariance across the whole probe
+            # corpus: attaching correct digests moves no verdict.
+            for _p in _c["probes"]:
+                _probe = {k: _p[k] for k in ("at", "state", "closureRoot")
+                          if k in _p}
+                assert verify(_born_c, _probe) == verify(_recs, _probe), \
+                    f"fmt sweep: verdict moved under born digests in {_c['name']}"
+                fmt["verdicts"] += 1
+            # (iii) root assembly: assembled from born digests ==
+            # recomputed, at every applied id of every case.
+            for _rid in _want_d["order"]:
+                assert _assembled_root(_born_c, _rid) == \
+                    ref.checkpoint_root(_recs, _rid), \
+                    f"fmt sweep: assembled != recomputed in {_c['name']}@{_rid}"
+                fmt["assembled"] += 1
+            # (iv) negative sweep: flip one born digest per case (every
+            # copy of one covered id) -> the assembled root breaks, while
+            # the recomputed root — the only one verify trusts — is
+            # unmoved by construction (it never read the field).
+            if _want_d["order"]:
+                _rid = _want_d["order"][0]
+                _idx = ref._index([ref._canonical_record(r) for r in _recs])
+                _parents = {i: ref._parents(_idx[i]) for i in _idx}
+                _closure = ref._closure_ids(_rid, _idx, _parents) or []
+                _target = sorted(_closure)[0] if _closure else None
+                if _target is not None:
+                    _flip = [dict(r) for r in _born_c]
+                    for _r in _flip:
+                        if _r["id"] == _target:
+                            _d = _r["digest"]
+                            _r["digest"] = (_d[:7]
+                                            + ("0" if _d[7] != "0" else "1")
+                                            + _d[8:])
+                    assert _assembled_root(_flip, _rid) != \
+                        ref.checkpoint_root(_recs, _rid), \
+                        f"fmt sweep: flipped digest did not break assembly in {_c['name']}@{_rid}"
+                    fmt["flipped"] += 1
     except AssertionError as e:
         print(f"\nPROPERTY FAILURE: {e}")
         return 1
 
-    total_disputes = sum(
+    total_statuses = sum(
         len(ref.retraction_status([dict(r) for r in c["records"]])["disputes"])
+        for c in CASES)
+    total_contested = sum(
+        len(ref.retraction_status([dict(r) for r in c["records"]])["contested"])
         for c in CASES)
     print(f"\nCONFORMANCE: {len(CASES)}/{len(CASES)} cases identical "
           f"(derive + {total_probes} checkpoint probes "
           f"+ {total_witnesses} witness-freshness checks "
           f"+ {total_roots} closure-root digests "
-          f"+ {total_disputes} retraction statuses); "
+          f"+ {total_deltas} delta-vs-full derivations "
+          f"+ {total_statuses} retraction statuses "
+          f"+ {total_contested} contested markings); "
           f"oracle+invariance {oracle_checks}, transport-pin {pin_checks}, "
           f"live-golden {golden_checks}, poc-quilt-1@task-c root "
           f"{POC_QUILT1_TASK_C_ROOT[:12]}… — all pass")
+    print(f"FRONTIER: {len(FRONTIER_CASES)}/{len(FRONTIER_CASES)} cases "
+          f"identical "
+          f"({sum(len(c['probes']) for c in FRONTIER_CASES)} verdict probes, "
+          f"{frontier_deltas} frontier delta-vs-full derivations over the "
+          f"whole corpus); poc-scale-1 frontier root "
+          f"{POC_SCALE1_FRONTIER_ROOT[:12]}… — all pass")
+    print(f"FORMAT-V2: {len(FORMAT_V2_CASES)}/{len(FORMAT_V2_CASES)} cases "
+          f"identical (derive + verify + freshness + roots + deltas, both "
+          f"ports, and identical to the stripped writings); born-ignored "
+          f"sweep {fmt['ignored']} corpus derivations byte-identical; "
+          f"{fmt['verdicts']} verdicts unmoved by born digests; root "
+          f"assembly {fmt['assembled']} assembled == recomputed, "
+          f"{fmt['flipped']} flipped digests break assembly; "
+          f"fmt-dup-copied-digest caught by assembly, VERIFIED by "
+          f"recompute; poc-quilt-1@task-c root {POC_QUILT1_TASK_C_ROOT[:12]}… "
+          f"unmoved — all pass")
+    print(f"LEAF-BAND: {len(LEAF_BAND_CASES)}/{len(LEAF_BAND_CASES)} cases "
+          f"identical (derive + verify + freshness + roots + deltas, both "
+          f"ports); {lb['leaves']} record leaves compared directly "
+          f"cross-port; {lb['roots']} closure-root digests; "
+          f"{sum(len(c['probes']) for c in LEAF_BAND_CASES)} verdict "
+          f"probes; leaves and roots pinned as referee literals — "
+          f"integral doubles in [1e16, 1e21) spelled as exact integer "
+          f"digits, 1e21 on the repr path — all pass")
+    print(f"PROTO-INDEX: {len(PROTO_INDEX_CASES)}/{len(PROTO_INDEX_CASES)} "
+          f"cases identical (derive + verify + freshness + roots + "
+          f"deltas, both ports); orphans, state and freshness pinned as "
+          f"literals for every case — \"__proto__\" is an ordinary "
+          f"effect key and record id, and a missing or non-string id is "
+          f"orphan-class under a content-digest placeholder "
+          f"(issue #38) — all pass")
     return 0
 
 

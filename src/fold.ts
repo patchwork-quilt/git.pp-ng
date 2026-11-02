@@ -110,12 +110,17 @@ function pyFloatRepr(n: number): string {
 
 function pyNumber(n: number): string {
   // JS numbers do not distinguish int from float after JSON.parse, so this
+  // BOUNDARY RULING (2026-10-20, on issue #28): the band is |v| < 1e21, pinned
+  // by docs/CHECKPOINT-V2.md, the referee, and the BEAM port. The leaf names
+  // the stored float64 value, whose exact decimal expansion is canonical in
+  // every port; shortest-round-trip repr is the fragile surface and the spec
+  // deliberately minimises it. The conformance LEAF-BAND family pins this.
   // reproduces Python's json.dumps number rendering (after the referee's
   // _leaf_num, which spells an integral value within |v| < 1e21 as a plain
   // integer). An integral value in that band takes the EXACT integer spelling
   // via BigInt — `String(n)` would give the shortest round-trip, which diverges
   // from Python's int() for integral doubles in [1e16, 1e21) (e.g.
-  // 724818294626474393600, not ...400000). Zero (incl. -0) is "0"; everything
+  // 724818294626474655744, not ...400000). Zero (incl. -0) is "0"; everything
   // else (non-integral, or |v| >= 1e21) goes through Python float repr.
   if (Number.isNaN(n)) return "NaN";
   if (!Number.isFinite(n)) return n > 0 ? "Infinity" : "-Infinity";
@@ -202,7 +207,10 @@ function parentsOf(rec: FoldRecord): string[] {
 
 function effectsOf(rec: FoldRecord): { [key: string]: unknown } {
   const eff = (rec as { effects?: unknown }).effects;
-  const out: { [key: string]: unknown } = {};
+  // Null-prototype: effect keys are arbitrary strings, and on a plain {}
+  // the key "__proto__" is not an entry but a prototype write — the key
+  // silently vanished here (issue #38).
+  const out: { [key: string]: unknown } = Object.create(null);
   if (eff && typeof eff === "object" && !Array.isArray(eff)) {
     for (const [k, v] of Object.entries(eff as { [key: string]: unknown })) {
       out[String(k)] = v;
@@ -218,17 +226,6 @@ function rankOf(rec: FoldRecord): number {
     return CLASS_RANK[kind];
   }
   return FALLBACK_RANK;
-}
-
-function kindOf(rec: FoldRecord): unknown {
-  return (rec as { kind?: unknown }).kind;
-}
-
-/** A record's author, if it carries a non-empty string one. Records in the
- * shipped sets carry no author at all; absence means unattributed. */
-function authorOf(rec: FoldRecord): string | null {
-  const a = (rec as { author?: unknown }).author;
-  return typeof a === "string" && a !== "" ? a : null;
 }
 
 /**
@@ -253,24 +250,89 @@ function cmpCodePoints(a: string, b: string): number {
   return ai.length - bi.length;
 }
 
+/** Canonical-order key for one record: pyCanonical of the record with any
+ * `digest` field removed. Format v2 (docs/FORMAT-V2.md): the digest is a
+ * claim ABOUT a record, never content the fold may consult, so it must not
+ * decide duplicate-id resolution — attaching, removing, or corrupting a
+ * digest cannot change which twin the fold keeps. Mirrors the referee's
+ * _index_sort_key. For a record without a digest (every v1 record) the key
+ * is byte-identical to the historical one. */
+function indexKey(rec: FoldRecord): string {
+  if (!("digest" in rec)) return pyCanonical(rec);
+  const rest: { [k: string]: unknown } = { ...rec };
+  delete rest.digest;
+  return pyCanonical(rest);
+}
+
+/** A string-keyed map with no prototype, so arbitrary record ids and
+ * effect keys — "__proto__" above all — are ordinary entries (issue
+ * #38). On a plain {}, assigning to "__proto__" writes the object's
+ * prototype instead of a property, and the entry silently vanishes. */
+function newStrMap<T>(): { [key: string]: T } {
+  return Object.create(null);
+}
+
+/** Assign an own enumerable data property even for the key "__proto__",
+ * where plain assignment would write the object's prototype instead
+ * (issue #38). Used for the fold's OUTPUT objects (derived state,
+ * witness freshness), whose shape and prototype stay as they were. */
+function setOwn<T>(obj: { [key: string]: T }, k: string, v: T): void {
+  Object.defineProperty(obj, k, {
+    value: v,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/** The orphan-class placeholder for a record whose id is missing or not
+ * a string (issue #38): "missing-id:" + SHA-256 of the record's
+ * canonical content with the id field EXCLUDED — the recordLeaf
+ * normalisation minus id, computed by the pinned digest machinery.
+ * DESIGN §1 defines a record as carrying a string `id` but is silent on
+ * a record that lacks one; the fold's ruling is that such a record is
+ * indexed under this placeholder and derive() holds it an orphan: it
+ * can never be referenced or applied, and it never silently merges with
+ * another id-less record — distinct contents give distinct
+ * placeholders, while identical contents are the same record served
+ * twice and share one. Mirrors the referee's _missing_id_placeholder. */
+function missingIdPlaceholder(rec: FoldRecord): string {
+  const r = rec as { kind?: unknown; reason?: unknown };
+  const normalized = {
+    parents: parentsOf(rec).slice().sort(cmpCodePoints),
+    kind: r.kind ?? null,
+    effects: effectsOf(rec),
+    reason: r.reason ?? null,
+  };
+  return "missing-id:" + sha256Hex(pyCanonical(normalized));
+}
+
+/** The index key for a record: its id when it is a string, else the
+ * missing-id placeholder. Mirrors the referee's _effective_id. Before
+ * this ruling a non-string id was String()-coerced (42 and "42"
+ * collided in one index slot) and a missing id keyed every such record
+ * to "undefined", each overwriting the last. */
+function effectiveId(rec: FoldRecord): string {
+  const id = (rec as { id?: unknown }).id;
+  return typeof id === "string" ? id : missingIdPlaceholder(rec);
+}
+
 /** id -> record, built in the same canonical order the Python referee
  * uses, so input permutation (and duplicate-id resolution) cannot differ. */
 function indexRecords(
   records: FoldRecord[],
 ): { [id: string]: FoldRecord } {
   const ordered = [...records].sort((a, b) => {
-    const ida = String((a as { id?: unknown }).id ?? "");
-    const idb = String((b as { id?: unknown }).id ?? "");
-    const byId = cmpCodePoints(ida, idb);
+    const byId = cmpCodePoints(effectiveId(a), effectiveId(b));
     if (byId !== 0) return byId;
     // Secondary key: Python sorts by json.dumps(..., sort_keys=True), which
     // ensure_ascii escapes to pure ASCII; pyCanonical matches byte-for-byte,
     // so a code-point compare here is identical to Python's.
-    return cmpCodePoints(pyCanonical(a), pyCanonical(b));
+    return cmpCodePoints(indexKey(a), indexKey(b));
   });
-  const idx: { [id: string]: FoldRecord } = {};
+  const idx: { [id: string]: FoldRecord } = newStrMap();
   for (const r of ordered) {
-    idx[String((r as { id?: unknown }).id)] = r;
+    idx[effectiveId(r)] = r;
   }
   return idx;
 }
@@ -323,8 +385,8 @@ type ParentsMap = { [id: string]: string[] };
 /** Nodes that cannot be topologically ordered (in, or blocked behind, a
  * parent cycle). Mirrors fold.py's _cycle_affected. */
 function cycleAffected(nodes: Set<string>, parents: ParentsMap): Set<string> {
-  const indeg: { [id: string]: number } = {};
-  const children: { [id: string]: string[] } = {};
+  const indeg: { [id: string]: number } = newStrMap();
+  const children: { [id: string]: string[] } = newStrMap();
   for (const r of nodes) {
     indeg[r] = 0;
     children[r] = [];
@@ -356,11 +418,11 @@ function cycleAffected(nodes: Set<string>, parents: ParentsMap): Set<string> {
 /** Kahn's algorithm, always taking the smallest ready id: one canonical
  * order. Mirrors fold.py's _topological (indegree counts only parents
  * inside the node set, so a subgraph gets its own canonical order; when
- * every parent is inside — the only shape the pre-spike fold passed —
- * the count is parents.length). */
+ * every parent is inside — the only shape the pre-retraction fold passed
+ * — the count is parents.length). */
 function topological(nodes: Set<string>, parents: ParentsMap): string[] {
-  const indeg: { [id: string]: number } = {};
-  const children: { [id: string]: string[] } = {};
+  const indeg: { [id: string]: number } = newStrMap();
+  const children: { [id: string]: string[] } = newStrMap();
   for (const r of nodes) {
     indeg[r] = parents[r].filter((p) => nodes.has(p)).length;
     children[r] = [];
@@ -387,174 +449,26 @@ function topological(nodes: Set<string>, parents: ParentsMap): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// SPIKE (retraction-spike branch — NOT merged semantics): dispute +
-// settlement records. Mirrors referee/fold.py's settlement pass exactly;
-// see the design block there and docs/RETRACTION-SPIKE.md. Two new kinds:
-//
-//   dispute    {target, reason (mandatory), author?} — claims the target's
-//              effects should not stand. While OPEN (unsettled, settled
-//              "rejected", settled by nobody with authority, or malformed)
-//              it changes NOTHING in derivation.
-//   settlement {dispute, resolution: "upheld"|"rejected", author?} — the
-//              settling record. It bites only if AUTHORITATIVE: its author
-//              is the target record's author, or a captain-class author
-//              (authored an applied override in this set). Anonymous
-//              settlements never bite.
-//
-// An upheld dispute RETRACTS its target: effects voided, derivation
-// re-runs, but the target keeps its graph position — descendants are not
-// orphaned and not auto-disputed, and a retracted ancestor lends no
-// cleanliness (counts as neither intent nor witness). Meta records are
-// never derivation steps: excluded from `order`, from candidacy (any
-// `effects` on them are void), and from ancestry tallies, but present in
-// the parents graph. A settled-upheld dispute targeting a meta record
-// VOIDS it; voiding cycles have no well-founded basis and are inert.
+// derive / verify_checkpoint
 // ---------------------------------------------------------------------------
 
-const META_KINDS = new Set(["dispute", "settlement"]);
-
-function isMeta(rec: FoldRecord): boolean {
-  const k = kindOf(rec);
-  return typeof k === "string" && META_KINDS.has(k);
-}
-
-interface SettlementPass {
-  retracted: Set<string>;
-  statuses: { [id: string]: string };
-}
-
-/** First pass of the fold: compute, from the record set alone, which
- * records are retracted and the status of every dispute. Mirrors
- * fold.py's _settlement_pass. */
-function settlementPass(
-  idx: { [id: string]: FoldRecord },
-  orphan: Set<string>,
-): SettlementPass {
-  const kind: { [id: string]: unknown } = {};
-  const author: { [id: string]: string | null } = {};
-  for (const rid of Object.keys(idx)) {
-    kind[rid] = kindOf(idx[rid]);
-    author[rid] = authorOf(idx[rid]);
-  }
-  const captains = new Set<string>();
-  for (const rid of Object.keys(idx)) {
-    if (kind[rid] === "override" && !orphan.has(rid) && author[rid]) {
-      captains.add(author[rid] as string);
-    }
-  }
-
-  // Well-formed disputes: target names a record in the set, reason is a
-  // non-empty string. A dispute that never landed (orphan) is inert.
-  const targetOf: { [id: string]: string } = {};
-  for (const rid of Object.keys(idx)) {
-    if (kind[rid] !== "dispute") continue;
-    const rec = idx[rid] as { target?: unknown; reason?: unknown };
-    if (typeof rec.target === "string" &&
-        Object.prototype.hasOwnProperty.call(idx, rec.target) &&
-        typeof rec.reason === "string" && rec.reason !== "") {
-      targetOf[rid] = rec.target;
-    }
-  }
-  const live = new Set<string>(
-    Object.keys(targetOf).filter((d) => !orphan.has(d)),
-  );
-
-  // Candidate settlements per dispute: well-formed, landed, attributed,
-  // and authoritative for that dispute.
-  const settlementsOn: { [id: string]: string[] } = {};
-  for (const rid of Object.keys(idx)) {
-    if (kind[rid] !== "settlement" || orphan.has(rid) || !author[rid]) {
-      continue;
-    }
-    const rec = idx[rid] as { dispute?: unknown; resolution?: unknown };
-    const d = rec.dispute;
-    if (typeof d !== "string" ||
-        !Object.prototype.hasOwnProperty.call(targetOf, d)) {
-      continue;
-    }
-    if (rec.resolution !== "upheld" && rec.resolution !== "rejected") {
-      continue;
-    }
-    const tgtAuthor = author[targetOf[d]];
-    if (author[rid] === tgtAuthor || captains.has(author[rid] as string)) {
-      if (!settlementsOn[d]) settlementsOn[d] = [];
-      settlementsOn[d].push(rid);
-    }
-  }
-
-  // Dispute-dependency graph: d depends on every dispute whose status
-  // decides whether d or one of d's candidate settlements is voided.
-  const depMap: { [id: string]: Set<string> } = {};
-  for (const d of live) {
-    const out = new Set<string>();
-    for (const d2 of live) {
-      if (targetOf[d2] === d ||
-          (settlementsOn[d] ?? []).includes(targetOf[d2])) {
-        out.add(d2);
-      }
-    }
-    depMap[d] = out;
-  }
-
-  const isVoided = (x: string, status: { [id: string]: string }): boolean => {
-    for (const d2 of live) {
-      if (targetOf[d2] === x && status[d2] === "upheld") return true;
-    }
-    return false;
-  };
-
-  // Evaluate in dependency order (Kahn-style over the dependency graph).
-  // Whatever cannot be evaluated — it sits in, or depends on, a voiding
-  // cycle — has no well-founded settlement basis and stays inert.
-  const status: { [id: string]: string } = {};
-  const remaining = new Set<string>(live);
-  for (;;) {
-    const ready = [...remaining]
-      .filter((d) => [...depMap[d]].every(
-        (x) => Object.prototype.hasOwnProperty.call(status, x)))
-      .sort(cmpCodePoints);
-    if (ready.length === 0) break;
-    for (const d of ready) {
-      if (isVoided(d, status)) {
-        status[d] = "inert"; // voided dispute never bites
-      } else {
-        const cands = (settlementsOn[d] ?? []).filter(
-          (s) => !isVoided(s, status));
-        if (cands.length === 0) {
-          status[d] = "open";
-        } else {
-          const ruling = [...cands].sort(cmpCodePoints)[0]; // smallest id
-          status[d] = String(
-            (idx[ruling] as { resolution?: unknown }).resolution);
-        }
-      }
-      remaining.delete(d);
-    }
-  }
-
-  const statuses: { [id: string]: string } = {};
-  for (const rid of Object.keys(idx)) {
-    if (kind[rid] === "dispute") statuses[rid] = status[rid] ?? "inert";
-  }
-  const retracted = new Set<string>();
-  for (const d of live) {
-    if (status[d] === "upheld" && !META_KINDS.has(String(kind[targetOf[d]]))) {
-      retracted.add(targetOf[d]);
-    }
-  }
-  return { retracted, statuses };
-}
-
-/** Records excluded from derivation: any ancestor absent, or blocked
- * behind such a record, or in/behind a parent cycle. Computed over ALL
- * records (meta kinds included — the parents graph is kind-blind).
- * Mirrors fold.py's _orphan_set; used by derive() and retractionStatus(). */
-function computeOrphans(
-  idx: { [id: string]: FoldRecord },
-  parents: ParentsMap,
-): Set<string> {
+/**
+ * LEGACY ENGINE — the pre-production fold, frozen verbatim as the
+ * differential oracle for the memoised-bitset engine (derive, below). It
+ * materialises the full applied-ancestor Set of every record, which is
+ * Θ(N × mean ancestors) in time and memory (measured: ~2.7–3.8 s and
+ * ~0.7–0.8 GB at 5,000 records — past the 128 MB Worker ceiling). Do not
+ * optimise or "fix" this copy; its byte-for-byte agreement with derive()
+ * on the conformance corpus and the differential fuzz is the new engine's
+ * correctness evidence.
+ */
+export function deriveLegacy(records: FoldRecord[]): DeriveOutput {
+  const idx = indexRecords([...records]);
   const ids = new Set<string>(Object.keys(idx));
-  const children: { [id: string]: string[] } = {};
+  const parents: ParentsMap = newStrMap();
+  for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
+
+  const children: { [id: string]: string[] } = newStrMap();
   for (const rid of Object.keys(idx)) children[rid] = [];
   for (const [rid, ps] of Object.entries(parents)) {
     for (const p of ps) {
@@ -563,10 +477,21 @@ function computeOrphans(
       }
     }
   }
+
+  // Orphans: a record is orphaned if any ancestor is absent, or is itself
+  // already orphaned. Worklist propagation, as in fold.py.
   const orphan = new Set<string>();
   const work: string[] = [];
   for (const rid of Object.keys(idx)) {
-    if (parents[rid].some((p) => !ids.has(p))) work.push(rid);
+    // Records indexed under a missing-id placeholder are orphans by
+    // construction (issue #38): seeded into the worklist alongside the
+    // missing-parent records, so the exclusion propagates.
+    if (
+      typeof (idx[rid] as { id?: unknown }).id !== "string" ||
+      parents[rid].some((p) => !ids.has(p))
+    ) {
+      work.push(rid);
+    }
   }
   for (const rid of work) orphan.add(rid);
   let head = 0;
@@ -582,49 +507,24 @@ function computeOrphans(
   const nonOrphan = new Set<string>();
   for (const rid of ids) if (!orphan.has(rid)) nonOrphan.add(rid);
   for (const rid of cycleAffected(nonOrphan, parents)) orphan.add(rid);
-  return orphan;
-}
-
-// ---------------------------------------------------------------------------
-// derive / verify_checkpoint
-// ---------------------------------------------------------------------------
-
-export function derive(records: FoldRecord[]): DeriveOutput {
-  const idx = indexRecords([...records]);
-  const ids = new Set<string>(Object.keys(idx));
-  const parents: ParentsMap = {};
-  for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
-
-  const orphan = computeOrphans(idx, parents);
-
-  // SPIKE: the settlement pass runs first, over the whole landed set;
-  // meta records are consumed by it and are never derivation steps.
-  const { retracted } = settlementPass(idx, orphan);
-  const meta = new Set<string>(
-    Object.keys(idx).filter((rid) => isMeta(idx[rid])));
 
   const applied: string[] = [];
-  for (const rid of ids) {
-    if (!orphan.has(rid) && !meta.has(rid)) applied.push(rid);
-  }
+  for (const rid of ids) if (!orphan.has(rid)) applied.push(rid);
   applied.sort(cmpCodePoints);
+  const appliedSet = new Set<string>(applied);
   const order = topological(new Set<string>(applied), parents);
 
-  // Full ancestor set of every landed record, memoised once per call in
-  // topological order (parents precede children). Computed over the whole
-  // landed graph — meta and retracted records included — so ancestry
-  // transitivity runs through them exactly as through any record; only
-  // candidacy (below) and the cleanliness tallies treat them specially.
-  // Precomputing means no ancestor walk is repeated across candidates or
-  // keys — the per-candidate re-walks were superlinear on deep contested
-  // keys (ADDENDUM #4 P5). Mirrors fold.py.
-  const anc: { [id: string]: Set<string> } = {};
-  const graphNodes = new Set<string>();
-  for (const rid of ids) if (!orphan.has(rid)) graphNodes.add(rid);
-  for (const rid of topological(graphNodes, parents)) {
+  // Full applied-ancestor set of every applied record, memoised once per call
+  // in topological order (parents precede children). anc[rid] is naturally
+  // applied-restricted: an applied record's parents are all applied, or it
+  // would itself be an orphan. Precomputing here means no ancestor walk is
+  // repeated across candidates or keys — the per-candidate re-walks were
+  // superlinear on deep contested keys (ADDENDUM #4 P5). Mirrors fold.py.
+  const anc: { [id: string]: Set<string> } = newStrMap();
+  for (const rid of order) {
     const a = new Set<string>();
     for (const p of parents[rid]) {
-      if (Object.prototype.hasOwnProperty.call(anc, p)) {
+      if (appliedSet.has(p)) {
         a.add(p);
         for (const x of anc[p]) a.add(x);
       }
@@ -632,11 +532,9 @@ export function derive(records: FoldRecord[]): DeriveOutput {
     anc[rid] = a;
   }
 
-  // Who sets each key, among applied records only. A retracted record's
-  // effects are voided: it is never a candidate, never a winner or loser.
-  const setters: { [key: string]: Set<string> } = {};
+  // Who sets each key, among applied records only.
+  const setters: { [key: string]: Set<string> } = newStrMap();
   for (const rid of applied) {
-    if (retracted.has(rid)) continue;
     for (const k of Object.keys(effectsOf(idx[rid]))) {
       if (!setters[k]) setters[k] = new Set<string>();
       setters[k].add(rid);
@@ -668,14 +566,9 @@ export function derive(records: FoldRecord[]): DeriveOutput {
       // records, then the smallest id. More deeds behind a value makes it
       // cleaner; more bare observations, weaker.
       const cleanliness = (c: string): [number, number, string] => {
-        // Meta records count as neither (they are not derivation); a
-        // retracted ancestor counts as neither either — the bounded
-        // stain: it stops lending intent weight, and is not demoted to
-        // a witness penalty (floor: counts as nothing).
         let intent = 0;
         let wit = 0;
         for (const a of anc[c]) {
-          if (meta.has(a) || retracted.has(a)) continue;
           const r = rankOf(idx[a]);
           if (r < WITNESS_RANK) intent += 1;
           if (r === WITNESS_RANK) wit += 1;
@@ -691,7 +584,529 @@ export function derive(records: FoldRecord[]): DeriveOutput {
       })[0];
     }
 
-    state[k] = effectsOf(idx[winner])[k];
+    setOwn(state, k, effectsOf(idx[winner])[k]);
+    const distinct = new Set<string>();
+    for (const c of cands) distinct.add(pyValueKey(effectsOf(idx[c])[k]));
+    if (distinct.size >= 2) {
+      conflicts.push({
+        key: k,
+        winner,
+        losers: cands.filter((c) => c !== winner).sort(cmpCodePoints),
+      });
+    }
+  }
+
+  const orphans = [...orphan].sort(cmpCodePoints);
+  return { state, order, conflicts, orphans };
+}
+
+// ---------------------------------------------------------------------------
+// Retraction (dispute + settlement) — FOLD LAW as of Casey's ruling,
+// 2026-11-02 (adopting PR #16 with the contested amendment; see
+// docs/RETRACTION-SPIKE.md for the design record and the duel it came
+// from). Mirrors referee/fold.py's settlement pass exactly. Two new kinds:
+//
+//   dispute    {target, reason (mandatory), author?} — claims the target's
+//              effects should not stand. While OPEN (unsettled, settled
+//              "rejected", settled by nobody with authority, or malformed)
+//              it changes NOTHING in derivation.
+//   settlement {dispute, resolution: "upheld"|"rejected", author?} — the
+//              settling record. It bites only if AUTHORITATIVE: its author
+//              is the target record's author, or a captain-class author
+//              (authored an applied override in this set). Anonymous
+//              settlements never bite.
+//
+// An upheld dispute RETRACTS its target: effects voided, derivation
+// re-runs, but the target keeps its graph position — descendants are not
+// orphaned and not auto-disputed, and a retracted ancestor lends no
+// cleanliness (counts as neither intent nor witness). Meta records are
+// never derivation steps: excluded from `order`, from candidacy (any
+// `effects` on them are void), and from ancestry tallies, but present in
+// the parents graph. A settled-upheld dispute targeting a meta record
+// VOIDS it; voiding cycles have no well-founded basis and are inert.
+//
+// THE CONTESTED AMENDMENT (the ruling's condition): when a record is
+// retracted on a ratified accusation — an upheld dispute that its author
+// neither filed nor settled — the retraction is not silent: the record is
+// marked CONTESTED in the retraction surface, with the dispute/settlement
+// provenance. A retraction the author filed or settled themselves is a
+// plain retraction, never "contested" — the fold claims only what the
+// records back up.
+// ---------------------------------------------------------------------------
+
+const META_KINDS = new Set(["dispute", "settlement"]);
+
+function kindOf(rec: FoldRecord): unknown {
+  return (rec as { kind?: unknown }).kind;
+}
+
+function isMeta(rec: FoldRecord): boolean {
+  const k = kindOf(rec);
+  return typeof k === "string" && META_KINDS.has(k);
+}
+
+/** A record's author, if it carries a non-empty string one. Records in
+ * the shipped sets carry no author at all; absence means unattributed.
+ * Mirrors fold.py's _author. */
+function authorOf(rec: FoldRecord): string | null {
+  const a = (rec as { author?: unknown }).author;
+  return typeof a === "string" && a !== "" ? a : null;
+}
+
+export interface ContestedEntry {
+  record: string;
+  dispute: string;
+  settlement: string;
+  disputed_by: string | null;
+  settled_by: string | null;
+}
+
+interface SettlementPass {
+  retracted: Set<string>;
+  statuses: { [id: string]: string };
+  contested: ContestedEntry[];
+}
+
+/** First pass of the fold: compute, from the record set alone, which
+ * records are retracted, the status of every dispute, and which
+ * retractions are contested. Mirrors fold.py's _settlement_pass. */
+function settlementPass(
+  idx: { [id: string]: FoldRecord },
+  orphan: Set<string>,
+): SettlementPass {
+  const kind: { [id: string]: unknown } = newStrMap();
+  const author: { [id: string]: string | null } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    kind[rid] = kindOf(idx[rid]);
+    author[rid] = authorOf(idx[rid]);
+  }
+  const captains = new Set<string>();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] === "override" && !orphan.has(rid) && author[rid]) {
+      captains.add(author[rid] as string);
+    }
+  }
+
+  // Well-formed disputes: target names a record in the set, reason is a
+  // non-empty string. A dispute that never landed (orphan) is inert.
+  const targetOf: { [id: string]: string } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] !== "dispute") continue;
+    const rec = idx[rid] as { target?: unknown; reason?: unknown };
+    if (typeof rec.target === "string" &&
+        Object.prototype.hasOwnProperty.call(idx, rec.target) &&
+        typeof rec.reason === "string" && rec.reason !== "") {
+      targetOf[rid] = rec.target;
+    }
+  }
+  const live = new Set<string>(
+    Object.keys(targetOf).filter((d) => !orphan.has(d)),
+  );
+
+  // Candidate settlements per dispute: well-formed, landed, attributed,
+  // and authoritative for that dispute.
+  const settlementsOn: { [id: string]: string[] } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] !== "settlement" || orphan.has(rid) || !author[rid]) {
+      continue;
+    }
+    const rec = idx[rid] as { dispute?: unknown; resolution?: unknown };
+    const d = rec.dispute;
+    if (typeof d !== "string" ||
+        !Object.prototype.hasOwnProperty.call(targetOf, d)) {
+      continue;
+    }
+    if (rec.resolution !== "upheld" && rec.resolution !== "rejected") {
+      continue;
+    }
+    const tgtAuthor = author[targetOf[d]];
+    if (author[rid] === tgtAuthor || captains.has(author[rid] as string)) {
+      if (!settlementsOn[d]) settlementsOn[d] = [];
+      settlementsOn[d].push(rid);
+    }
+  }
+
+  // Dispute-dependency graph: d depends on every dispute whose status
+  // decides whether d or one of d's candidate settlements is voided.
+  const depMap: { [id: string]: Set<string> } = newStrMap();
+  for (const d of live) {
+    const out = new Set<string>();
+    for (const d2 of live) {
+      if (targetOf[d2] === d ||
+          (settlementsOn[d] ?? []).includes(targetOf[d2])) {
+        out.add(d2);
+      }
+    }
+    depMap[d] = out;
+  }
+
+  const isVoided = (x: string, status: { [id: string]: string }): boolean => {
+    for (const d2 of live) {
+      if (targetOf[d2] === x && status[d2] === "upheld") return true;
+    }
+    return false;
+  };
+
+  // Evaluate in dependency order (Kahn-style over the dependency graph).
+  // Whatever cannot be evaluated — it sits in, or depends on, a voiding
+  // cycle — has no well-founded settlement basis and stays inert.
+  const status: { [id: string]: string } = newStrMap();
+  const rulingOf: { [id: string]: string } = newStrMap();
+  const remaining = new Set<string>(live);
+  for (;;) {
+    const ready = [...remaining]
+      .filter((d) => [...depMap[d]].every(
+        (x) => Object.prototype.hasOwnProperty.call(status, x)))
+      .sort(cmpCodePoints);
+    if (ready.length === 0) break;
+    for (const d of ready) {
+      if (isVoided(d, status)) {
+        status[d] = "inert"; // voided dispute never bites
+      } else {
+        const cands = (settlementsOn[d] ?? []).filter(
+          (s) => !isVoided(s, status));
+        if (cands.length === 0) {
+          status[d] = "open";
+        } else {
+          const ruling = [...cands].sort(cmpCodePoints)[0]; // smallest id
+          rulingOf[d] = ruling;
+          status[d] = String(
+            (idx[ruling] as { resolution?: unknown }).resolution);
+        }
+      }
+      remaining.delete(d);
+    }
+  }
+
+  const statuses: { [id: string]: string } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] === "dispute") statuses[rid] = status[rid] ?? "inert";
+  }
+  const retracted = new Set<string>();
+  for (const d of live) {
+    if (status[d] === "upheld" && !META_KINDS.has(String(kind[targetOf[d]]))) {
+      retracted.add(targetOf[d]);
+    }
+  }
+
+  // Contested: the ruling's amendment. A retraction is contested exactly
+  // when the record proves the author stood behind the work: the target
+  // HAS an author, the upheld dispute was filed by someone else (or by
+  // nobody attributable), and the ruling settlement was authored by
+  // someone else. If the author filed the dispute or settled it, the
+  // retraction is the author's own act and is never marked contested.
+  const contested: ContestedEntry[] = [];
+  for (const d of live) {
+    if (status[d] !== "upheld") continue;
+    const t = targetOf[d];
+    if (META_KINDS.has(String(kind[t]))) continue;
+    const tAuthor = author[t];
+    if (tAuthor === null) continue;
+    const s = rulingOf[d];
+    if (author[d] !== tAuthor && author[s] !== tAuthor) {
+      contested.push({
+        record: t,
+        dispute: d,
+        settlement: s,
+        disputed_by: author[d],
+        settled_by: author[s],
+      });
+    }
+  }
+  contested.sort((a, b) =>
+    cmpCodePoints(a.record, b.record) || cmpCodePoints(a.dispute, b.dispute));
+  return { retracted, statuses, contested };
+}
+
+/**
+ * The settlement pass as data — a sibling surface to witnessFreshness,
+ * not a change to derive()'s output shape (TypeScript port of the
+ * referee's retraction_status; checked against it by the conformance
+ * harness).
+ *
+ * Returns {disputes: {disputeId: status}, retracted: [recordId],
+ * contested: [entry]} where status is "open" (no authoritative ruling
+ * yet), "upheld"/"rejected" (the smallest-id authoritative, unvoided
+ * settlement's ruling), or "inert" (malformed, orphaned, voided, or
+ * cycle-entangled — the dispute cannot bite). Each contested entry is
+ * {record, dispute, settlement, disputed_by, settled_by}: the provenance
+ * of a retraction the target's author neither filed nor settled (Casey's
+ * contested amendment, 2026-11-02 — a ratified accusation is marked,
+ * never a silent void). Pure function of the record set, like derive().
+ */
+export function retractionStatus(records: FoldRecord[]): {
+  disputes: { [id: string]: string };
+  retracted: string[];
+  contested: ContestedEntry[];
+} {
+  const { idx, orphan } = prepareDerive(records);
+  const { retracted, statuses, contested } = settlementPass(idx, orphan);
+  return {
+    disputes: statuses,
+    retracted: [...retracted].sort(cmpCodePoints),
+    contested,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Memoised ancestry engine (production derive).
+//
+// Same semantics as deriveLegacy — DESIGN.md is the spec, byte-for-byte —
+// with the ancestry machinery rebuilt so no per-record ancestor SET is
+// ever materialised:
+//
+// - Ancestry is one flat bitset per applied record (strict ancestors),
+//   built once per derive in topological order by OR-ing parent rows:
+//   O(N × parents × N/32) word operations, N²/8 bytes total (≈3 MB at
+//   5,000 records, vs ~0.7 GB of Set objects in the legacy engine).
+// - Dominance is exact, as in the legacy engine: candidate c is dominated
+//   iff c's bit is set in the union of the pool's ancestor rows.
+// - Tie-break counts (intent / witness ancestors) are masked popcounts
+//   over a candidate's row, computed once per record and memoised across
+//   every key and comparison — the legacy engine re-walked the ancestor
+//   set inside its sort comparator, per key.
+// ---------------------------------------------------------------------------
+
+interface PreparedDerive {
+  idx: { [id: string]: FoldRecord };
+  parents: ParentsMap;
+  applied: string[];
+  order: string[];
+  orphan: Set<string>;
+  /** Records whose effects the settlement pass voided (subset of applied:
+   * retracted records keep their order slots; they are never candidates). */
+  retracted: Set<string>;
+  /** Topological order over ALL landed records (meta included) — the
+   * ancestry index spans the landed graph so transitivity runs through
+   * meta and retracted records exactly as the referee's does. */
+  landedOrder: string[];
+}
+
+/** The front half of the fold (canonical index, orphan propagation, cycle
+ * exclusion, canonical Kahn order) — the index/orphan half is logic
+ * identical to deriveLegacy's; the settlement pass and the meta exclusion
+ * from `applied` run here, so every consumer of the prepared set (derive,
+ * and through it the delta path) folds under the same retraction law. */
+function prepareDerive(records: FoldRecord[]): PreparedDerive {
+  const idx = indexRecords([...records]);
+  const ids = new Set<string>(Object.keys(idx));
+  const parents: ParentsMap = newStrMap();
+  for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
+
+  const children: { [id: string]: string[] } = newStrMap();
+  for (const rid of Object.keys(idx)) children[rid] = [];
+  for (const [rid, ps] of Object.entries(parents)) {
+    for (const p of ps) {
+      if (Object.prototype.hasOwnProperty.call(children, p)) {
+        children[p].push(rid);
+      }
+    }
+  }
+
+  const orphan = new Set<string>();
+  const work: string[] = [];
+  for (const rid of Object.keys(idx)) {
+    // Records indexed under a missing-id placeholder are orphans by
+    // construction (issue #38): seeded into the worklist alongside the
+    // missing-parent records, so the exclusion propagates.
+    if (
+      typeof (idx[rid] as { id?: unknown }).id !== "string" ||
+      parents[rid].some((p) => !ids.has(p))
+    ) {
+      work.push(rid);
+    }
+  }
+  for (const rid of work) orphan.add(rid);
+  let head = 0;
+  while (head < work.length) {
+    for (const c of children[work[head]] ?? []) {
+      if (!orphan.has(c)) {
+        orphan.add(c);
+        work.push(c);
+      }
+    }
+    head += 1;
+  }
+  const nonOrphan = new Set<string>();
+  for (const rid of ids) if (!orphan.has(rid)) nonOrphan.add(rid);
+  for (const rid of cycleAffected(nonOrphan, parents)) orphan.add(rid);
+
+  // The settlement pass runs over the whole landed set (orphan computed
+  // above over all records, meta included); meta records are consumed by
+  // it and are never derivation steps, so `applied` excludes them.
+  // Retracted records stay in `applied`/`order` — they keep their slots;
+  // derive() excludes them from candidacy via `retracted`.
+  const { retracted } = settlementPass(idx, orphan);
+  const applied: string[] = [];
+  for (const rid of ids) {
+    if (!orphan.has(rid) && !isMeta(idx[rid])) applied.push(rid);
+  }
+  applied.sort(cmpCodePoints);
+  const order = topological(new Set<string>(applied), parents);
+  const landed: string[] = [];
+  for (const rid of ids) if (!orphan.has(rid)) landed.push(rid);
+  const landedOrder = topological(new Set<string>(landed), parents);
+  return { idx, parents, applied, order, orphan, retracted, landedOrder };
+}
+
+const POP8 = new Uint8Array(256);
+for (let i = 1; i < 256; i++) POP8[i] = POP8[i >> 1] + (i & 1);
+
+function popcount32(x: number): number {
+  return (
+    POP8[x & 0xff] +
+    POP8[(x >>> 8) & 0xff] +
+    POP8[(x >>> 16) & 0xff] +
+    POP8[x >>> 24]
+  );
+}
+
+interface AncestryIndex {
+  /** Number of applied records (rows). */
+  n: number;
+  /** Uint32 words per row. */
+  words: number;
+  /** Flat strict-ancestor bitsets: row r starts at r * words. */
+  bits: Uint32Array;
+  /** Record id -> row (its position in topological order). */
+  pos: Map<string, number>;
+  /** Bit i set iff the record at row i carries intent (rank < witness). */
+  intentMask: Uint32Array;
+  /** Bit i set iff the record at row i ranks as a witness. */
+  witnessMask: Uint32Array;
+}
+
+/** Build the ancestor bitsets over the applied records in topological
+ * order (parents precede children, so a row is the OR of its parents'
+ * rows plus the parents' own bits). An applied record's parents are all
+ * applied — otherwise it would be an orphan — so every parent resolves
+ * to a row; the undefined check mirrors the legacy appliedSet guard. */
+function buildAncestry(
+  order: string[],
+  parents: ParentsMap,
+  idx: { [id: string]: FoldRecord },
+  tallyExclude?: Set<string>,
+): AncestryIndex {
+  const n = order.length;
+  const words = Math.ceil(n / 32);
+  const bits = new Uint32Array(n * words);
+  const pos = new Map<string, number>();
+  const intentMask = new Uint32Array(words);
+  const witnessMask = new Uint32Array(words);
+  for (let i = 0; i < n; i++) {
+    pos.set(order[i], i);
+    // Records in tallyExclude (meta and retracted records, when the
+    // caller passes them) set NEITHER mask bit: they are present in the
+    // ancestry bits — domination runs through them — but lend no
+    // cleanliness, exactly as the referee's tallies treat them.
+    if (tallyExclude && tallyExclude.has(order[i])) continue;
+    const r = rankOf(idx[order[i]]);
+    if (r < WITNESS_RANK) intentMask[i >> 5] |= 1 << (i & 31);
+    else witnessMask[i >> 5] |= 1 << (i & 31);
+  }
+  for (let i = 0; i < n; i++) {
+    const row = i * words;
+    for (const p of parents[order[i]]) {
+      const pi = pos.get(p);
+      if (pi === undefined) continue;
+      const prow = pi * words;
+      for (let w = 0; w < words; w++) bits[row + w] |= bits[prow + w];
+      bits[row + (pi >> 5)] |= 1 << (pi & 31);
+    }
+  }
+  return { n, words, bits, pos, intentMask, witnessMask };
+}
+
+function maskedPopcount(anc: AncestryIndex, row: number, mask: Uint32Array): number {
+  const off = row * anc.words;
+  let s = 0;
+  for (let w = 0; w < anc.words; w++) s += popcount32(anc.bits[off + w] & mask[w]);
+  return s;
+}
+
+function rowPopcount(anc: AncestryIndex, row: number): number {
+  const off = row * anc.words;
+  let s = 0;
+  for (let w = 0; w < anc.words; w++) s += popcount32(anc.bits[off + w]);
+  return s;
+}
+
+export function derive(records: FoldRecord[]): DeriveOutput {
+  const { idx, parents, applied, order, orphan, retracted, landedOrder } =
+    prepareDerive(records);
+  // Ancestry spans the whole landed graph — meta and retracted records
+  // included — so domination transitivity runs through them exactly as
+  // through any record (the referee computes its ancestor sets the same
+  // way); only the cleanliness tallies treat them specially, via the
+  // tally exclusion below.
+  const tallyExclude = new Set<string>();
+  for (const rid of landedOrder) {
+    if (isMeta(idx[rid]) || retracted.has(rid)) tallyExclude.add(rid);
+  }
+  const anc = buildAncestry(landedOrder, parents, idx, tallyExclude);
+
+  // Who sets each key, among applied records only. A retracted record's
+  // effects are voided: it is never a candidate, never a winner or loser.
+  const setters: { [key: string]: Set<string> } = newStrMap();
+  for (const rid of applied) {
+    if (retracted.has(rid)) continue;
+    for (const k of Object.keys(effectsOf(idx[rid]))) {
+      if (!setters[k]) setters[k] = new Set<string>();
+      setters[k].add(rid);
+    }
+  }
+
+  // Per-record tie-break counts, computed lazily once and shared across
+  // keys: intent = applied strict ancestors ranked below witness,
+  // wit = applied strict ancestors ranked as witnesses — the same counts
+  // deriveLegacy re-derives by walking anc[c] inside its comparator.
+  const intentCnt = new Int32Array(anc.n).fill(-1);
+  const witCnt = new Int32Array(anc.n).fill(-1);
+  const countsOf = (row: number): [number, number] => {
+    if (intentCnt[row] < 0) {
+      intentCnt[row] = maskedPopcount(anc, row, anc.intentMask);
+      witCnt[row] = maskedPopcount(anc, row, anc.witnessMask);
+    }
+    return [intentCnt[row], witCnt[row]];
+  };
+
+  const union = new Uint32Array(anc.words);
+  const state: { [key: string]: unknown } = {};
+  const conflicts: Conflict[] = [];
+  for (const k of Object.keys(setters).sort(cmpCodePoints)) {
+    const cands = [...setters[k]].sort(cmpCodePoints);
+    let best = Infinity;
+    for (const c of cands) best = Math.min(best, rankOf(idx[c]));
+    const pool = cands.filter((c) => rankOf(idx[c]) === best);
+    // Exact maximality: a candidate is dominated iff it is a (transitive)
+    // ancestor of ANY other pool candidate — iff its bit is set in the
+    // union of the pool's ancestor rows. (A row never contains its own
+    // bit, so including the candidate's own row in the union is harmless.)
+    union.fill(0);
+    for (const d of pool) {
+      const drow = (anc.pos.get(d) as number) * anc.words;
+      for (let w = 0; w < anc.words; w++) union[w] |= anc.bits[drow + w];
+    }
+    const maximal = pool
+      .filter((c) => {
+        const ci = anc.pos.get(c) as number;
+        return (union[ci >> 5] & (1 << (ci & 31))) === 0;
+      })
+      .sort(cmpCodePoints);
+    let winner: string;
+    if (maximal.length === 1) {
+      winner = maximal[0];
+    } else {
+      winner = [...maximal].sort((a, b) => {
+        const [ai, aw] = countsOf(anc.pos.get(a) as number);
+        const [bi, bw] = countsOf(anc.pos.get(b) as number);
+        if (ai !== bi) return bi - ai; // most intent ancestors first
+        if (aw !== bw) return aw - bw; // then fewest witness ancestors
+        return cmpCodePoints(a, b); // then smallest id
+      })[0];
+    }
+
+    setOwn(state, k, effectsOf(idx[winner])[k]);
     const distinct = new Set<string>();
     for (const c of cands) distinct.add(pyValueKey(effectsOf(idx[c])[k]));
     if (distinct.size >= 2) {
@@ -779,7 +1194,7 @@ function sha256Hex(input: string): string {
  * derived state is MISMATCH, and a reason re-version (which the fold ignores,
  * so derived state is unchanged) is STATE-ONLY rather than a silent VERIFIED.
  * Mirrors the referee's _record_leaf. */
-function recordLeaf(rec: FoldRecord): string {
+export function recordLeaf(rec: FoldRecord): string {
   const r = rec as { id?: unknown; kind?: unknown; reason?: unknown };
   const normalized = {
     id: String(r.id ?? ""),
@@ -811,6 +1226,45 @@ function closureIds(
   return [...closure];
 }
 
+/** Normalise a checkpoint `at` — string form (v2) or frontier array form
+ * (docs/FRONTIER-CHECKPOINTS.md) — to a member list, or null if the form is
+ * malformed: an empty array, duplicate members, or non-string members.
+ * Readers dispatch structurally on the type; malformed arrays are rejected
+ * here so every caller (root / verify / frontier build / deriveDelta) fails
+ * safe the same way. A non-string scalar keeps the historical String()
+ * coercion of the singleton path. Mirrors the referee's _frontier_members. */
+function frontierMembers(at: unknown): string[] | null {
+  if (typeof at === "string") return [at];
+  if (Array.isArray(at)) {
+    if (at.length === 0) return null;
+    const seen = new Set<string>();
+    for (const m of at) {
+      if (typeof m !== "string") return null;
+      if (seen.has(m)) return null;
+      seen.add(m);
+    }
+    return [...at] as string[];
+  }
+  return [String(at)];
+}
+
+/** Union of the ancestor closures of every member, or null if any member is
+ * absent or any member's closure is incomplete. */
+function closureIdsMulti(
+  members: string[],
+  idx: { [id: string]: FoldRecord },
+  parents: ParentsMap,
+): string[] | null {
+  const union = new Set<string>();
+  for (const m of members) {
+    if (!Object.prototype.hasOwnProperty.call(idx, m)) return null;
+    const cl = closureIds(m, idx, parents);
+    if (cl === null) return null;
+    for (const id of cl) union.add(id);
+  }
+  return [...union];
+}
+
 /**
  * Deterministic digest of `at`'s full ancestor closure as seen in `records`;
  * null if `at` is absent or its closure is incomplete. Mirrors the referee's
@@ -821,17 +1275,23 @@ function closureIds(
  *
  * where recordLeaf covers the whole canonical record (id, parents sorted, kind,
  * effects, reason) in the float64 domain.
+ *
+ * Frontier form: `at` may be an ARRAY of ids, in which case the digest is
+ * computed by the identical construction over the UNION of the members'
+ * closures — v2's root was always a digest of a set of ids; the singleton
+ * closure was just the set it happened to be computed over. A one-member
+ * array therefore digests byte-identically to the string form.
  */
 export function checkpointRoot(
   records: FoldRecord[],
-  at: string,
+  at: string | string[],
 ): string | null {
   const idx = indexRecords([...records]);
-  const atId = String(at);
-  if (!Object.prototype.hasOwnProperty.call(idx, atId)) return null;
-  const parents: ParentsMap = {};
+  const members = frontierMembers(at);
+  if (members === null) return null;
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
-  const closure = closureIds(atId, idx, parents);
+  const closure = closureIdsMulti(members, idx, parents);
   if (closure === null) return null;
   const entries = closure
     .sort(cmpCodePoints)
@@ -852,6 +1312,16 @@ export type CheckpointResult = boolean | "VERIFIED" | "STATE-ONLY" | "MISMATCH";
  * matches but the closure has changed since the checkpoint — the honest v1
  * answer, now labelled, never a silent VERIFIED), or "MISMATCH" (state differs,
  * or the checkpoint shape is unusable). Backwards compatible.
+ *
+ * Frontier form: `at` may be an ARRAY of ids (docs/FRONTIER-CHECKPOINTS.md).
+ * The covered set C is the union of the members' closures, recomputed within
+ * the presented set: state is derive(C).state, the root is the v2 construction
+ * over C. Descendant growth never enters a member's closure, so a grown set
+ * still verifies VERIFIED; a member absent from the set, or any member's
+ * closure incomplete in it (a covered record removed), cannot reproduce C and
+ * is MISMATCH; a covered member re-versioned in a way the fold ignores (a
+ * `reason`-only change) is STATE-ONLY. A malformed array (empty, duplicates,
+ * non-string members) is MISMATCH / false as above.
  */
 export function verifyCheckpoint(
   records: FoldRecord[],
@@ -871,24 +1341,214 @@ export function verifyCheckpoint(
   ) {
     return v2 ? "MISMATCH" : false;
   }
-  const at = String(atRaw);
+  const members = frontierMembers(atRaw);
+  if (members === null) return v2 ? "MISMATCH" : false;
 
   const idx = indexRecords([...records]);
+  const parents: ParentsMap = newStrMap();
+  for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
+  const closure = closureIdsMulti(members, idx, parents);
   let stateOk = false;
-  if (Object.prototype.hasOwnProperty.call(idx, at)) {
-    const parents: ParentsMap = {};
-    for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
-    const closure = closureIds(at, idx, parents);
-    if (closure !== null) {
-      const subset = closure.sort(cmpCodePoints).map((rid) => idx[rid]);
-      stateOk = pyDeepEqual(derive(subset).state, want);
-    }
+  if (closure !== null) {
+    const subset = closure.sort(cmpCodePoints).map((rid) => idx[rid]);
+    stateOk = pyDeepEqual(derive(subset).state, want);
   }
 
   if (!v2) return stateOk;
   if (!stateOk) return "MISMATCH";
-  const actualRoot = checkpointRoot(records, at);
+  const actualRoot = checkpointRoot(records, members);
+  // RULING — STATE-ONLY stands (Casey, 2026-11-02, adopting the lane's
+  // recommendation): when the state matches but the closure root does
+  // not, the verdict is "STATE-ONLY" — this is a different state, full
+  // stop. Verification does NOT accuse a shrunk or swapped closure of
+  // tampering ("MISMATCH"), because a closure root alone cannot back
+  // that claim up: it proves difference, not substitution.
+  //
+  // TAILOR-FIT: this return is the decision point. To rule MISMATCH for
+  // the root-differs case instead, the checkpoint format must first pin
+  // the closure's size and/or member id-set alongside the root (a small
+  // format addition in checkpointRoot / buildCheckpoint and in EVERY
+  // port of this fold), verification must compare the pin here, and
+  // only a pin failure — not a root failure — may read as MISMATCH.
+  // Until such a pin exists in the format, keep this verdict STATE-ONLY:
+  // say only what the record proves.
   return actualRoot === String(expectedRoot) ? "VERIFIED" : "STATE-ONLY";
+}
+
+// ---------------------------------------------------------------------------
+// delta derivation (checkpoint + tail) — the read-path optimisation.
+// A checkpoint pins a record's ancestor closure (state + closure root + the
+// closure records). The read path re-derives without re-reading the closure:
+// supply the checkpoint and only the TAIL (records outside the closure), and
+// derive() runs over closure ∪ tail — the full record set, so the result is
+// byte-identical to derive(all). The win is on READS; the fold is unchanged.
+// Mirrors the referee's build_checkpoint / derive_delta.
+// ---------------------------------------------------------------------------
+
+export interface Checkpoint {
+  /** A single record id (v2 string form), or the frontier member ids
+   * (frontier array form, |F| >= 2 — see buildFrontierCheckpoint). */
+  at: string | string[];
+  state: { [key: string]: unknown };
+  closureRoot: string;
+  closure: FoldRecord[];
+}
+
+/** Construct a checkpoint for `at` over `records`, or null if `at`'s closure is
+ * incomplete. Closure records are emitted in canonical (code-point id) order so
+ * both ports build an identical object. */
+export function buildCheckpoint(
+  records: FoldRecord[],
+  at: string,
+): Checkpoint | null {
+  const idx = indexRecords([...records]);
+  const atId = String(at);
+  if (!Object.prototype.hasOwnProperty.call(idx, atId)) return null;
+  const parents: ParentsMap = newStrMap();
+  for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
+  const closure = closureIds(atId, idx, parents);
+  if (closure === null) return null;
+  const closureRecords = closure.sort(cmpCodePoints).map((rid) => idx[rid]);
+  const root = checkpointRoot(records, atId);
+  if (root === null) return null;
+  return {
+    at: atId,
+    state: derive(closureRecords).state,
+    closureRoot: root,
+    closure: closureRecords,
+  };
+}
+
+/**
+ * Construct a FRONTIER checkpoint (docs/FRONTIER-CHECKPOINTS.md): `at` names
+ * a SET of records — the frontier — and the checkpoint pins the union C of
+ * their ancestor closures, with state = derive(C).state and the v2 closure
+ * root computed over C by the identical construction.
+ *
+ * With `frontierIds` omitted, the frontier is computed as the maximal
+ * APPLIED records (applied records no other applied record descends from).
+ * For that frontier, C is exactly derive's applied set — every applied
+ * record is an ancestor-or-self of a maximal applied record, and every
+ * ancestor of an applied record is applied — so the pinned state is the
+ * full derived state of `records`, not a partial state.
+ *
+ * Canonical form: a one-member frontier is emitted in the STRING form, so
+ * the result is byte-identical to buildCheckpoint at that record; the array
+ * form always means |F| >= 2. Members are emitted sorted by code point.
+ * Returns null when no valid checkpoint exists: no applied records (auto
+ * frontier), an absent member, an incomplete member closure, or a malformed
+ * member list. Mirrors the referee's build_frontier_checkpoint.
+ */
+export function buildFrontierCheckpoint(
+  records: FoldRecord[],
+  frontierIds?: string[],
+): Checkpoint | null {
+  const idx = indexRecords([...records]);
+  const parents: ParentsMap = newStrMap();
+  for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
+  let members: string[];
+  if (frontierIds === undefined) {
+    const applied = derive(records).order;
+    if (applied.length === 0) return null;
+    const appliedSet = new Set<string>(applied);
+    const hasAppliedChild = new Set<string>();
+    for (const rid of applied) {
+      for (const p of parents[rid]) {
+        if (appliedSet.has(p)) hasAppliedChild.add(p);
+      }
+    }
+    members = applied
+      .filter((r) => !hasAppliedChild.has(r))
+      .sort(cmpCodePoints);
+  } else {
+    const norm = frontierMembers(frontierIds);
+    if (norm === null) return null;
+    members = [...norm].sort(cmpCodePoints);
+  }
+  const closure = closureIdsMulti(members, idx, parents);
+  if (closure === null) return null;
+  const closureRecords = closure.sort(cmpCodePoints).map((rid) => idx[rid]);
+  const root = checkpointRoot(records, members);
+  if (root === null) return null;
+  return {
+    at: members.length === 1 ? members[0] : [...members],
+    state: derive(closureRecords).state,
+    closureRoot: root,
+    closure: closureRecords,
+  };
+}
+
+/** Delta derivation. Returns a DeriveOutput equal to derive(closure ∪ tail), or
+ * null to signal "fall back to the full fold". Null on any doubt: malformed
+ * checkpoint, a duplicate id in the closure, a stored closure that is not
+ * exactly `at`'s ancestor closure or whose root != the pinned closureRoot,
+ * a closure that does not re-derive to the pinned state, or a tail record
+ * that RE-VERSIONS a closure record (same id, divergent content). A tail
+ * record carrying a covered id with deep-equal content is a duplicate
+ * serving of that record, not a re-version: it is dropped, exactly as
+ * collection dedupes identical duplicates (DESIGN's collection rules).
+ *
+ * Frontier form: the checkpoint's `at` may be an ARRAY of ids
+ * (docs/FRONTIER-CHECKPOINTS.md); the stored closure must then be exactly
+ * the union of the members' ancestor closures within itself. The string
+ * form is the one-member special case, unchanged. */
+export function deriveDelta(
+  checkpoint: Checkpoint | null | undefined,
+  tailRecords: FoldRecord[],
+): DeriveOutput | null {
+  if (typeof checkpoint !== "object" || checkpoint === null) return null;
+  const { at, state, closureRoot, closure } = checkpoint;
+  if (
+    (typeof at !== "string" && !Array.isArray(at)) ||
+    typeof state !== "object" ||
+    state === null ||
+    Array.isArray(state) ||
+    typeof closureRoot !== "string" ||
+    !Array.isArray(closure)
+  ) {
+    return null;
+  }
+  const members = frontierMembers(at);
+  if (members === null) return null;
+  const closureIdSet = new Set<string>();
+  const closureById = new Map<string, FoldRecord>();
+  for (const r of closure) {
+    const id = (r as { id?: unknown }).id;
+    if (typeof id !== "string") return null;
+    if (closureIdSet.has(id)) return null; // duplicate id in the closure
+    closureIdSet.add(id);
+    closureById.set(id, r);
+  }
+  if (!members.every((m) => closureIdSet.has(m))) return null;
+  // The stored closure must be exactly the members' ancestor closure within
+  // itself.
+  const idx = indexRecords([...closure]);
+  const parents: ParentsMap = newStrMap();
+  for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
+  const cl = closureIdsMulti(members, idx, parents);
+  if (cl === null) return null;
+  if (cl.length !== closureIdSet.size || !cl.every((id) => closureIdSet.has(id))) {
+    return null;
+  }
+  if (checkpointRoot(closure, members) !== closureRoot) return null;
+  if (!pyDeepEqual(derive(closure).state, state)) return null;
+  // Tail/closure overlap by id. Identical content under a covered id is a
+  // duplicate serving of the covered record — drop it. (This is the normal
+  // case, not an exotic one: a checkpoint commit's tree inherits the
+  // project repo's record.json, that commit is never in its own cover, so
+  // the record it carries is re-read as tail on every delta read of that
+  // project.) Divergent content under a covered id is a re-versioned
+  // covered record — the tripwire still fires and the full fold decides.
+  const tail: FoldRecord[] = [];
+  for (const r of tailRecords) {
+    const id = (r as { id?: unknown }).id;
+    if (typeof id === "string" && closureIdSet.has(id)) {
+      if (!pyDeepEqual(r, closureById.get(id))) return null;
+      continue;
+    }
+    tail.push(r);
+  }
+  return derive([...closure, ...tail]);
 }
 
 /**
@@ -906,12 +1566,16 @@ export function verifyCheckpoint(
  * cycle-excluded witnesses are absent, exactly as they are absent from
  * derive()'s state). derive()'s own output is untouched, so /api/state is
  * unaffected.
+ *
+ * LEGACY IMPLEMENTATION (witnessFreshnessLegacy): a per-witness DFS over
+ * the parent graph. Frozen as the differential oracle for the bitset
+ * implementation (witnessFreshness, below).
  */
-export function witnessFreshness(records: FoldRecord[]): { [id: string]: number } {
+export function witnessFreshnessLegacy(records: FoldRecord[]): { [id: string]: number } {
   const idx = indexRecords([...records]);
   const out = derive(records);
   const applied = new Set<string>(out.order);
-  const parents: ParentsMap = {};
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
 
   const ancestorsIncl = (start: string): Set<string> => {
@@ -930,31 +1594,33 @@ export function witnessFreshness(records: FoldRecord[]): { [id: string]: number 
   const result: { [id: string]: number } = {};
   for (const rid of out.order) {
     const kind = (idx[rid] as { kind?: unknown }).kind;
-    if (kind === "witness") result[rid] = total - ancestorsIncl(rid).size;
+    if (kind === "witness") setOwn(result, rid, total - ancestorsIncl(rid).size);
   }
   return result;
 }
 
 /**
- * SPIKE: the settlement pass as data — a sibling surface to
- * witnessFreshness, not a change to derive()'s output shape (TypeScript
- * port of the referee's retraction_status; checked against it by the
- * conformance harness).
- *
- * Returns {disputes: {disputeId: status}, retracted: [recordId]} where
- * status is "open" (no authoritative ruling yet), "upheld"/"rejected"
- * (the smallest-id authoritative, unvoided settlement's ruling), or
- * "inert" (malformed, orphaned, voided, or cycle-entangled — the
- * dispute cannot bite). Pure function of the record set, like derive().
+ * witnessFreshness on the bitset engine. recordsBehind(w) counts the
+ * applied records outside w's causal past (w included in its own past);
+ * on bitsets that is `total − (popcount(ancestors(w)) + 1)` — every
+ * ancestor of an applied record is itself applied, so the row popcount
+ * is exactly the size of the legacy DFS's applied-restricted set.
+ * Byte-identical to witnessFreshnessLegacy (differential-tested).
  */
-export function retractionStatus(records: FoldRecord[]): {
-  disputes: { [id: string]: string };
-  retracted: string[];
-} {
+export function witnessFreshness(records: FoldRecord[]): { [id: string]: number } {
   const idx = indexRecords([...records]);
-  const parents: ParentsMap = {};
+  const out = derive(records);
+  const parents: ParentsMap = newStrMap();
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
-  const orphan = computeOrphans(idx, parents);
-  const { retracted, statuses } = settlementPass(idx, orphan);
-  return { disputes: statuses, retracted: [...retracted].sort(cmpCodePoints) };
+  const anc = buildAncestry(out.order, parents, idx);
+
+  const total = out.order.length;
+  const result: { [id: string]: number } = {};
+  for (const rid of out.order) {
+    const kind = (idx[rid] as { kind?: unknown }).kind;
+    if (kind === "witness") {
+      setOwn(result, rid, total - (rowPopcount(anc, anc.pos.get(rid) as number) + 1));
+    }
+  }
+  return result;
 }

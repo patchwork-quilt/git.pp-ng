@@ -25,14 +25,34 @@ Refusals (checked before anything is pushed — the fold is unchanged):
     with --kind witness.)
   * an empty-parents (genesis) record is refused unless --genesis is passed
     AND the project has no records yet; the error names the current frontier.
+  * an override that rules on a key no record in its ancestor closure set
+    or observed is refused: an override is a ruling, not an invention — you
+    cannot rule on a key your lineage never touched. The error names the
+    ungrounded key(s); the fix is to descend from a record that set/observed
+    the key, or to record a witness first and let the human rule.
   * a witness carrying non-observation effect keys is warned (stderr), never
     refused — a witness reporting measured state (env.*) is legal.
+
+  Records are written in format v2 (docs/FORMAT-V2.md): after the refusals,
+  at the single record.json write point, the record is born with a `digest`
+  field — "sha256:" + the checkpoint-v2 record leaf of its content,
+  computed by the referee's leaf implementation (referee/fold.py), never
+  reimplemented here. The fold never reads the field; it is an integrity
+  claim readers may verify, not an input to derivation.
   pp.py state <project>                      derived state + conflicts
   pp.py verify <project> --at ID [--tamper]  checkpoint check against the
                                              Python referee (../poc)
   pp.py collect <project>                    print the collected records
                                              as JSON (used by scene.sh
                                              and the determinism shuffle)
+  pp.py checkpoint <project> [--at ID]       create/update the project's
+                         [--dry-run]         read-path checkpoint (checkpoint.json
+                                             on the project repo; gated write).
+                                             Default is a FRONTIER checkpoint
+                                             (the maximal applied records; their
+                                             closures cover the whole applied
+                                             set); --at pins one record instead.
+                                             Lets /api/state read only the tail.
 
 Config (environment):
   PP_WORKER           Worker base URL
@@ -422,6 +442,60 @@ def empty_effects_refusal(record):
             "not filed. Record an observation with --kind witness.")
 
 
+def ancestor_closure_keys(record, records):
+    """Effect keys set by the record's ancestor closure: every record
+    reachable from the record's parents by following parent links, the
+    parents themselves included. An unknown parent id contributes nothing
+    (and would orphan the record in the fold anyway)."""
+    by_id = {}
+    for r in records:
+        rid = r.get("id")
+        if rid and rid not in by_id:
+            by_id[rid] = r
+    keys = set()
+    seen = set()
+    stack = list(record.get("parents") or [])
+    while stack:
+        rid = stack.pop()
+        if rid in seen:
+            continue
+        seen.add(rid)
+        r = by_id.get(rid)
+        if r is None:
+            continue
+        for k in (r.get("effects") or {}):
+            keys.add(str(k))
+        stack.extend(r.get("parents") or [])
+    return keys
+
+
+def override_grounding_refusal(record, records):
+    """None if the record may proceed; else a teaching refusal message.
+    An override is a RULING: it may only change keys its ancestry already
+    set or observed. An override ruling on a key no ancestor touched is
+    inventing state from nowhere — the M3 failure shape, in which a bare
+    observation ('disk is at 94%') was drafted as an override inventing a
+    config value no record in its lineage had ever set. Only kind ==
+    'override' is checked: tasks ORIGINATE keys — that is their job — and
+    witnesses report, they do not rule."""
+    if record.get("kind") != "override":
+        return None
+    eff = record.get("effects")
+    if not isinstance(eff, dict) or not eff:
+        return None
+    grounded = ancestor_closure_keys(record, records)
+    ungrounded = sorted(str(k) for k in eff if str(k) not in grounded)
+    if not ungrounded:
+        return None
+    return (
+        "ungrounded override: an override is a ruling, not an invention — "
+        "it may only change keys its ancestry set or observed, and no record "
+        f"in this override's ancestry set or observed: {', '.join(ungrounded)}. "
+        "Fix: descend from a record that set or observed the key (add it to "
+        "--parents), or record the observation as a witness first "
+        "(--kind witness) and let your human rule on it.")
+
+
 def _project_of(repo):
     """The project a repo belongs to: the part before the first '--'."""
     return repo.split("--", 1)[0]
@@ -444,6 +518,39 @@ def project_records(project):
     q = urllib.parse.urlencode({"project": project})
     out = http("GET", "/api/records", raw_query=q)
     return out.get("records") or []
+
+
+# --------------------------------------------------------------------------
+# format v2: records born with digests (docs/FORMAT-V2.md)
+# --------------------------------------------------------------------------
+
+def born_digest(record):
+    """The record's format-v2 digest: "sha256:" + the checkpoint-v2 record
+    leaf of its content. The leaf comes from the referee's implementation
+    ONLY (referee/fold.py `_record_leaf`, via _load_poc) — the digest
+    dialect (five-field projection, canonical JSON, float64 domain) is
+    inherited, never reimplemented here, so a runner-written digest cannot
+    drift from the dialect checkpoints and the Worker verify against. The
+    leaf does not cover the `digest` field itself."""
+    fold, _poc_pp = _load_poc()
+    return "sha256:" + fold._record_leaf(record)
+
+
+def attach_digest(record):
+    """Return the record with a correct born digest as a sibling field.
+
+    A record already carrying the correct digest keeps it (the same object
+    is returned — its bytes, field order included, are untouched); an
+    absent, malformed, or stale claim is replaced by the digest of the
+    content actually being written. This runs only on a record about to be
+    written by `complete` — history is never rewritten."""
+    want = born_digest(record)
+    cur = record.get("digest")
+    if isinstance(cur, str) and cur == want:
+        return record
+    out = dict(record)
+    out["digest"] = want
+    return out
 
 
 def cmd_complete(args):
@@ -480,6 +587,7 @@ def cmd_complete(args):
         print(f"pp: warning: {line}", file=sys.stderr)
     # 4. Genesis guard: a root record (empty parents) needs --genesis AND an
     #    empty project. Only queries the Worker when parents are empty.
+    existing = None
     if not parents:
         project = _project_of(args.repo)
         existing = project_records(project)
@@ -487,6 +595,15 @@ def cmd_complete(args):
                                _frontier_ids(existing))
         if msg:
             die(msg)
+    # 5. Override grounding: an override may only rule on keys its ancestry
+    #    set or observed. Queries the Worker for the project's records (the
+    #    read is public; the refusal still fires before any token or push).
+    if args.kind == "override":
+        if existing is None:
+            existing = project_records(_project_of(args.repo))
+        msg = override_grounding_refusal(record, existing)
+        if msg:
+            die(f"refusing to push {args.id}: {msg}")
 
     token = mint_token(args.repo, "write")
     tmp = tempfile.mkdtemp(prefix="pp-complete-")
@@ -505,6 +622,9 @@ def cmd_complete(args):
                     shutil.copytree(item, target, dirs_exist_ok=True)
                 else:
                     shutil.copy2(item, target)
+        # Format v2: the record is born with its digest. Computed here —
+        # after every refusal above, at the single record.json write point.
+        record = attach_digest(record)
         (dest / "record.json").write_text(json.dumps(record, indent=2) + "\n")
         git(["add", "-A"], env, cwd=dest)
         git([*GIT_IDENT, "commit", "-q", "-m", f"record {args.id}"], env, cwd=dest)
@@ -588,6 +708,138 @@ def cmd_collect(args):
     records, tmp = collect_records(args.project)
     try:
         print(json.dumps(records, indent=2, sort_keys=True))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _repo_updated_at():
+    """repo name -> updatedAt (from /api/repos), for the checkpoint's cover
+    manifest (the Worker skips re-reading a covered task repo while this
+    matches)."""
+    listing = http("GET", "/api/repos")
+    return {r.get("name"): r.get("updatedAt") for r in listing.get("repos", [])}
+
+
+def _collect_with_origin(project):
+    """Clone the project repo + every <project>--* repo and collect records the
+    same way the Worker does (project: one record per commit on main, oldest
+    first; task repos: HEAD record.json), returning
+    (records, origin, project_commit_ids, tmpdir) where:
+      origin: record id -> repo name it was first collected from;
+      project_commit_ids: {commit hash -> record id} for the project repo.
+    First-seen wins, exactly as the Worker's dedupe, so the project repo is
+    credited first. Caller removes tmpdir."""
+    _fold, poc_pp = _load_poc()
+    listing = http("GET", "/api/repos")
+    names = sorted(
+        r["name"] for r in listing.get("repos", [])
+        if r.get("name") == project or str(r.get("name", "")).startswith(project + "--")
+    )
+    if project not in names:
+        die(f"project repo {project} not found in namespace")
+    tmp = tempfile.mkdtemp(prefix="pp-checkpoint-")
+    records, origin, seen = [], {}, set()
+    project_commit_ids = {}
+    project_dir = None
+    # Project repo first (so it wins first-seen), then task repos sorted.
+    ordered = [project] + [n for n in names if n != project]
+    for name in ordered:
+        try:
+            token = mint_token(name, "read")
+        except SystemExit:
+            token = mint_token(name, "write")
+        parent = Path(tmp) / name
+        parent.mkdir(parents=True)
+        dest = fresh_checkout(name, token, parent)
+        if name == project:
+            project_dir = str(dest)
+            hashes = poc_pp._git(str(dest), "log", "--reverse", "--format=%H", "main").split()
+            for h in hashes:
+                rec = poc_pp._show_record(str(dest), h)
+                if rec is not None and isinstance(rec.get("id"), str):
+                    project_commit_ids[h] = rec["id"]
+            recs = poc_pp.project_records(str(dest))
+        else:
+            recs = poc_pp.task_records(str(dest))
+        for rec in recs:
+            rid = str(rec.get("id"))
+            if rid not in seen:
+                seen.add(rid)
+                records.append(rec)
+                origin[rid] = name
+    return records, origin, project_commit_ids, project_dir, tmp
+
+
+def cmd_checkpoint(args):
+    import datetime
+    fold, _poc_pp = _load_poc()
+    records, origin, project_commit_ids, project_dir, tmp = _collect_with_origin(args.project)
+    try:
+        if args.at:
+            # --at keeps the single-record placement (forensics/regression):
+            # the checkpoint pins that one record's ancestor closure.
+            cp = fold.build_checkpoint([dict(x) for x in records], str(args.at))
+            if cp is None:
+                die(f"record {args.at!r} has an incomplete closure — cannot checkpoint there")
+        else:
+            # Default: a FRONTIER checkpoint (docs/FRONTIER-CHECKPOINTS.md).
+            # The frontier is the set of maximal applied records; the covered
+            # set is the union of their closures, which for the auto-computed
+            # frontier is exactly the whole applied set — coverage no longer
+            # depends on the project's chain topology (a single-record
+            # checkpoint covers only one strand of a wide, parallel project).
+            cp = fold.build_frontier_checkpoint([dict(x) for x in records])
+            if cp is None:
+                die("no checkpointable frontier (no applied records, or a "
+                    "frontier member has an incomplete closure)")
+        at = cp["at"]
+        at_label = at if isinstance(at, str) else "frontier:" + "+".join(at)
+        closure_ids = {str(r["id"]) for r in cp["closure"]}
+        updated = _repo_updated_at()
+        cover_task_repos = {}
+        for rid in closure_ids:
+            repo = origin.get(rid)
+            if repo and repo != args.project:
+                cover_task_repos[repo] = {"updatedAt": updated.get(repo), "id": rid}
+        cover_project_commits = {
+            h: rid for h, rid in project_commit_ids.items() if rid in closure_ids
+        }
+        stored = {
+            # v is documentation only — readers dispatch on the structural
+            # form of `at` (string vs array), never on v. Frontier files
+            # (array form) carry v: 3; single-record files stay v: 2.
+            "v": 3 if isinstance(at, list) else 2,
+            "project": args.project,
+            "createdAt": datetime.datetime.now(datetime.timezone.utc)
+            .isoformat().replace("+00:00", "Z"),
+            "at": cp["at"],
+            "state": cp["state"],
+            "closureRoot": cp["closureRoot"],
+            "closure": cp["closure"],
+            "coverProjectCommits": cover_project_commits,
+            "coverTaskRepos": cover_task_repos,
+        }
+        if args.dry_run:
+            print(json.dumps(stored, indent=2, sort_keys=True))
+            return
+        # Push checkpoint.json to the project repo (admin-gated write token).
+        token = mint_token(args.project, "write")
+        env = git_env(token)
+        # Re-clone a clean project checkout to push from (project_dir was a
+        # read clone; mint a write token and push a fresh commit).
+        push_parent = Path(tmp) / "__checkpoint_push"
+        push_parent.mkdir(parents=True)
+        dest = fresh_checkout(args.project, token, push_parent)
+        (dest / "checkpoint.json").write_text(json.dumps(stored, indent=2) + "\n")
+        git(["add", "checkpoint.json"], env, cwd=dest)
+        git([*GIT_IDENT, "commit", "-q", "-m", f"checkpoint at {at_label} "
+             f"({len(closure_ids)} records in closure)"], env, cwd=dest)
+        git(["push", "-q", "origin", "main"], env, cwd=dest)
+        print(f"checkpoint written to {args.project}: at={at_label}, "
+              f"closure={len(closure_ids)} records "
+              f"({len(cover_task_repos)} task repos + "
+              f"{len(cover_project_commits)} project commits covered), "
+              f"root={cp['closureRoot'][:12]}…")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -686,6 +938,18 @@ def main(argv=None):
     p = sub.add_parser("collect")
     p.add_argument("project")
     p.set_defaults(fn=cmd_collect)
+
+    p = sub.add_parser("checkpoint",
+                       help="create/update the project's read-path checkpoint "
+                            "(checkpoint.json on the project repo; gated write)")
+    p.add_argument("project")
+    p.add_argument("--at",
+                   help="record id to checkpoint at (default: a frontier "
+                        "checkpoint over the maximal applied records, whose "
+                        "closures cover the whole applied set)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the checkpoint JSON instead of pushing it")
+    p.set_defaults(fn=cmd_checkpoint)
 
     args = ap.parse_args(argv)
     args.fn(args)
