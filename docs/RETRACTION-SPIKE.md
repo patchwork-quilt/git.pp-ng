@@ -1,9 +1,12 @@
-# SPIKE: Retraction (dispute + settlement) — branch only, NOT merged semantics
+# Retraction (dispute + settlement) — fold law, adopted 2026-11-02
 
-> **Status: exploratory spike on the `retraction-spike` branch.** Nothing in
-> this document is shipped semantics. DESIGN.md as merged on `main` does not
-> know these kinds exist. The design source is the post-competition design
-> duel (`research/deep/retraction-design-duel.md` §5 in the R&D repo): GLM's
+> **Status: MERGED — this is shipped fold semantics** (PR #16, adopted by
+> Casey's ruling of 2026-11-02, with the contested amendment below;
+> DESIGN.md §2 states the law in brief). This document began as the
+> spike's design record and is kept — filename included — as the full
+> semantics reference the PR and the code comments point at. The design
+> source is the post-competition design duel
+> (`research/deep/retraction-design-duel.md` §5 in the R&D repo): GLM's
 > winning spine — `dispute` + `settlement` kinds, disputes fold-inert until
 > settled, settlement is itself a record — which independently converged
 > with the Grid note's open/settled lifecycle (an open proposal and an open
@@ -87,21 +90,39 @@ meta record are void — meta records are never candidates.
 10. **Surface.** `derive()`'s output shape is unchanged. The settlement
     pass is exposed as a sibling pure function,
     `retraction_status` / `retractionStatus`, returning
-    `{disputes: {id: "open"|"upheld"|"rejected"|"inert"}, retracted: […]}`,
-    mirroring `witness_freshness`'s pattern.
+    `{disputes: {id: "open"|"upheld"|"rejected"|"inert"}, retracted: […],
+    contested: […]}` (item 11), mirroring `witness_freshness`'s pattern.
+11. **Contested (the amendment).** A retraction is **contested** exactly
+    when the record proves its author stood behind the work: the target
+    has an author, the upheld dispute was filed by someone else (or by
+    nobody attributable), and the ruling settlement was authored by
+    someone else. Contested entries are
+    `{record, dispute, settlement, disputed_by, settled_by}`, sorted by
+    (record, dispute) — the provenance, stated as data. A retraction the
+    author filed or settled themselves is a plain retraction, never
+    contested; an unattributed target is never contested (there is no
+    author the records show standing behind it).
 
-## ⚠ Doctrine flag — OPEN, deliberately unresolved
+## The doctrine flag — RESOLVED (Casey's ruling, 2026-11-02)
 
 Duel §6, the captain's question: **may a third party's accusation, once
 ratified, stain a record its author still stands behind — or is "wrong" a
-word only an author may say about their own work?** This spike implements
+word only an author may say about their own work?** The spike implemented
 the *mechanics* (a captain-class settlement upholding a third party's
 dispute does retract the target — see harness case `ret-captain-upheld`)
-**without any stain**: no output marks a retraction as contested, and no
-provenance flag distinguishes self-retraction from ratified accusation.
-Awaiting the captain's ruling; if the ruling is no-stain, what changes is
-the authority rule (item 2b for third-party disputes), not the
-bookkeeping.
+**without any stain**, and flagged the question as the captain's to rule.
+
+**The ruling: the mechanics stand, and the stain is real but factual.**
+A ratified accusation marks the record **contested** — visibly, in
+derived state, with the dispute/settlement provenance (item 11) — rather
+than silently voiding its effect. The governing constraint, in the
+captain's words: *"we only want to make sure we're saying things we can
+back up."* Every claim the fold and its renderers make about a retracted
+record must be exactly what the record proves — who disputed it, who
+settled it, and whether its author was either of them. The renderers
+(the Check text in gitpp-action and gitpp-app) show contested
+retractions under that word, with provenance, in the releases that
+vendored this law.
 
 ## Known gaps named by the spike
 
@@ -115,3 +136,10 @@ bookkeeping.
 - **Runner / Worker untouched.** `pp.py` gains no dispute/settlement
   authoring here; the Worker inherits the semantics automatically because
   it runs this fold. Collection, refusals, and transport are unchanged.
+- **Frontier interaction (found and fixed at merge).** The spike branched
+  before frontier checkpoints existed. A settlement is typically a leaf
+  meta record, so the auto frontier — then computed over maximal
+  *applied* records — left landed rulings outside every member closure
+  and pinned the unretracted state. The frontier now ranges over maximal
+  *landed* records and the theorem is restated as C == landed set
+  (`docs/FRONTIER-CHECKPOINTS.md`); pre-law sets are unaffected.

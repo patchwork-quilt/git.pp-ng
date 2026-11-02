@@ -5,7 +5,11 @@
 //  1. The full conformance corpus (cases.json as written by harness.py):
 //     new == legacy on derive() and witnessFreshness() for every case,
 //     compared by canonical JSON (pyCanonical), so key order cannot hide
-//     a divergence and array order cannot fake one.
+//     a divergence and array order cannot fake one. EXCEPTION, by design:
+//     cases carrying dispute/settlement records are skipped and counted —
+//     the frozen legacy engine predates the retraction law (2026-11-02)
+//     and MUST diverge there (it has no settlement pass); those cases are
+//     pinned against the Python referee by the harness instead.
 //  2. Seeded random small graphs (cycles, ghost parents, duplicate ids,
 //     unknown kinds, float edge values): new == legacy on the base graph.
 //  3. Parents-order / input-order permutations of every fuzz graph: the
@@ -41,7 +45,16 @@ const cases = JSON.parse(readFileSync(casesPath, "utf8")) as {
   name: string;
   records: FoldRecord[];
 }[];
+let skippedLaw = 0;
 for (const c of cases) {
+  const lawBearing = c.records.some((r) => {
+    const k = (r as { kind?: unknown }).kind;
+    return k === "dispute" || k === "settlement";
+  });
+  if (lawBearing) {
+    skippedLaw += 1;
+    continue;
+  }
   check(`corpus ${c.name} derive`, derive(c.records), deriveLegacy(c.records));
   check(
     `corpus ${c.name} freshness`,
@@ -49,7 +62,10 @@ for (const c of cases) {
     witnessFreshnessLegacy(c.records),
   );
 }
-console.log(`net 1: ${cases.length} corpus cases compared (derive + freshness)`);
+console.log(
+  `net 1: ${cases.length - skippedLaw} corpus cases compared (derive + freshness); ` +
+  `${skippedLaw} retraction-law cases skipped (legacy predates the law)`,
+);
 
 // --- Nets 2+3: seeded fuzz with permutations ------------------------------
 function mulberry32(seed: number): () => number {
