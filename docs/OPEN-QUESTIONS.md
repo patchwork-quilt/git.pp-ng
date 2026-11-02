@@ -310,6 +310,12 @@ override set. A `locks` entry means **narrower defaults** cannot override that k
 
 ### Position
 
+- **DECIDED — (A) (Casey, 2026-11-02).** Override always wins, even over a
+  locked default: locks constrain defaults, not deeds, and a policy that
+  must bind is modelled as an override itself. (A) was also the
+  recommendation below. §1d remains design-only — no code implements
+  scoped defaults — so the ruling changes no behaviour today; it binds
+  any future implementation of this section.
 - **Recommended — (A).** Defaults are a class below task; `locks` bind narrower
   defaults only; `override` stays sovereign; a mandatory policy is expressed *as*
   an override. One clean ladder, with nothing that silently beats a reasoned
@@ -332,7 +338,7 @@ override set. A `locks` entry means **narrower defaults** cannot override that k
 | 1a | `reads` value-form vs key-form; whether hazards may ever influence winner selection (recommend **never**) | Engineering — resolvable by the (a)/(b) measurement above |
 | 1b | record-count vs key-scoped freshness (`keysSupersededSince`) | Engineering — ship v2 if operators are misled |
 | 1c | verification in the fold (self-consistency + companion overrides) **vs** an ingest gate | **Captain** — it is the "no trusted service in the state path" boundary (DESIGN §7) |
-| 1d | lock-vs-override: option (A) **vs** (B)/mandate tier | **Captain** — governance sovereignty |
+| 1d | lock-vs-override | **DECIDED (A)** — 2026-11-02, Casey: override always wins (see §1d Position) |
 
 The two engineering questions are decidable with data from real task streams.
 The two captain questions are trust-model choices the fold can implement either

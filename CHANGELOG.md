@@ -13,12 +13,49 @@ as a whole.
 
 ## [Unreleased]
 
-- **Retraction semantics are open.** PR #16 (a spike: dispute + settlement
-  records) proposes how a record can be retracted and what a retraction
-  does to derived state. It is deliberately unmerged: until it is ruled
-  on, the fold has no retraction, and derived state treats every landed
-  record as standing. A ruling either way is a fold-semantics change and
-  will be called out here when it lands.
+## [0.2.0] — 2026-11-02
+
+Retraction is fold law. Casey's ruling of 2026-11-02 adopted PR #16
+(dispute + settlement) **with the contested amendment**, under the
+governing constraint that the fold says only what the records can back
+up. Two further rulings from the same packet are recorded in this
+release; neither changes fold behaviour.
+
+- **Dispute + settlement records.** The fold is now two passes: a
+  settlement pass computes the retracted set from the record set alone
+  (a settlement bites only if its author is the target's author or
+  captain-class — the author of an applied override; anonymous
+  settlements never bite; open/rejected/unauthoritative disputes are
+  exactly inert), then the classic derivation runs over what stands. An
+  upheld dispute voids the target's effects; the target keeps its graph
+  position and order slot, lends no cleanliness, and its descendants are
+  unaffected except through derivation itself. Full semantics:
+  `docs/RETRACTION-SPIKE.md`; DESIGN.md §2 states the law in brief.
+- **The contested amendment.** A retraction the target's author neither
+  filed nor settled — a ratified third-party accusation — is marked
+  **contested** on the retraction surface
+  (`retraction_status` / `retractionStatus` gains `contested` entries:
+  `{record, dispute, settlement, disputed_by, settled_by}`), never a
+  silent void. Self-filed or self-settled retractions are never marked.
+- **Frontier checkpoints range over maximal landed records** (was:
+  maximal applied). A settlement is typically a leaf meta record; the
+  applied-only frontier left landed rulings outside every closure and
+  pinned the unretracted state. The theorem is restated as
+  C == landed set (`docs/FRONTIER-CHECKPOINTS.md`); sets without meta
+  records — including the frozen poc-scale-1 frontier — are unchanged.
+- **STATE-ONLY stands** (checkpoint closure differences stay
+  informational, never accused as MISMATCH). The ruling, its date, and
+  tailor-fit guidance are recorded in code comments at the verification
+  decision point in both ports.
+- **Lock sovereignty DECIDED (A)** (`docs/OPEN-QUESTIONS.md` §1d):
+  override always wins; locks constrain defaults, not deeds; a
+  must-bind policy is modelled as an override. Design-only; no code
+  models scoped defaults yet.
+- Conformance at this tag: **1155/1155 cases identical** across the two
+  folds (863 pre-law cases + 34 retraction cases + 258 sprinkled
+  inertness variants), 1161 checkpoint probes, 302 retraction statuses
+  and 8 contested markings pinned, plus the worker and runner suites —
+  `npm test` runs all three, and CI asserts the measured counts.
 
 ## [0.1.0] — 2026-11-02
 

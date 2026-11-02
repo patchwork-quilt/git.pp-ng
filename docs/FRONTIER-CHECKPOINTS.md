@@ -17,7 +17,7 @@ little ancestry — any single record's closure is one strand. On the frozen
 `poc-scale-1` fixture (62 records), the largest single closure covers **21 of
 62**, so a single-record delta read still re-reads 41 records as tail. The
 project's read cost is governed by its **frontier** — the set of maximal
-applied records — not by any chain. The frontier of `poc-scale-1` is four
+landed records — not by any chain. The frontier of `poc-scale-1` is four
 records (`t40`, `t50`, `t60`, `witness-1`), and the union of their closures
 is **62 of 62**.
 
@@ -59,29 +59,36 @@ set of ids.
   the structural check above is the discriminator, and it fails safe in
   both directions (see Rollout safety).
 
-## The C == applied-set theorem
+## The C == landed-set theorem
 
-For the **auto frontier** — the maximal applied records, computed by
+For the **auto frontier** — the maximal landed records, computed by
 `buildFrontierCheckpoint(records)` with no member list — the covered set is
 not a partial cover:
 
-> **C is exactly derive's applied set.** Every ancestor of an applied record
-> is applied (⊆). And every applied record is an ancestor-or-self of a
-> maximal applied record — follow children within the finite applied DAG
-> until maximal (⊇).
+> **C is exactly the landed set** (every record present and non-orphan,
+> meta records included). Every ancestor of a landed record is landed (⊆).
+> And every landed record is an ancestor-or-self of a maximal landed
+> record — follow children within the finite landed DAG until maximal (⊇).
 
 So a frontier checkpoint's pinned `state` is **the** derived state of the
 whole set at creation, and its `deriveDelta` tail is exactly the records
-outside the applied set plus whatever arrived after creation. Records
+outside the landed set plus whatever arrived after creation. Records
 outside C are precisely the never-coverable ones — orphan-affected records
 (incomplete closure) and cycle members; under the singleton scheme they
 could never enter a checkpoint closure either, and the frontier form
-changes nothing for them. The harness asserts C == applied set and
+changes nothing for them. The harness asserts C == landed set and
 pinned state == full derived state for **every** case in the corpus.
+
+(The theorem was originally stated over the applied set. The retraction
+law (2026-11-02) made landed ⊋ applied: a settlement is typically a leaf
+meta record that no applied record descends from, so a maximal-applied
+frontier left landed rulings outside every closure and pinned a state
+that ignored them. Ranging over landed records restores the theorem;
+on any set without meta records the two frontiers are the same set.)
 
 When members are given explicitly (`buildFrontierCheckpoint(records, ids)`),
 C is the union of those members' closures — which may be a proper subset of
-the applied set (e.g. one strand pinned deliberately). The theorem is a
+the landed set (e.g. one strand pinned deliberately). The theorem is a
 statement about the auto frontier.
 
 ## What the verdict means for a frontier checkpoint
@@ -92,7 +99,7 @@ presented set S from the member list, then
 
 | Result | Frontier meaning |
 |---|---|
-| `VERIFIED` | S reproduces the pinned covered set exactly (root matches) and its derived state matches. Stronger than the singleton case: *the entire pinned past — the whole applied set as of creation — is byte-intact.* The checkpoint partitions the set into a verified past and an unpinned present. |
+| `VERIFIED` | S reproduces the pinned covered set exactly (root matches) and its derived state matches. Stronger than the singleton case: *the entire pinned past — the whole landed set as of creation — is byte-intact.* The checkpoint partitions the set into a verified past and an unpinned present. |
 | `STATE-ONLY` | Root differs but `derive(C).state` still equals the pinned state: covered content moved without moving the state — e.g. a `reason`-only re-version of a covered record (the whole-record leaf catches it; the fold ignores it; v2's FIX-3 case, now over the whole set), or an effect change to a record whose value the fold never selects (a dominated record's losing value). A tamper that *does* reach the state is `MISMATCH`. |
 | `MISMATCH` | The state differs, **or C cannot be reproduced at all**: a frontier member absent from S, or any member's closure incomplete in S (a covered record was removed). This is the v2-consistent ruling — singleton v2 already answers `MISMATCH` when the closure can't be re-derived — applied member-wise. |
 | `false` (v1, no `closureRoot`) | The v1 bool over C: `derive(C).state == pinned`, or the form is malformed. |
@@ -103,7 +110,7 @@ presented set S from the member list, then
   any member's closure. Growth in the ancestor direction is impossible for
   an honestly created frontier checkpoint — a new record could enter
   `closure(f)` only by being a previously missing parent of something in
-  it, but frontier members are applied, which means their closures were
+  it, but frontier members are landed, which means their closures were
   already complete at creation. (Contrast the singleton case, where an `at`
   chosen mid-chain can gain late ancestors in exactly this way.) The only
   events that move a frontier root are re-versioning of a covered record
@@ -137,7 +144,7 @@ is the singleton one, with the builder as the only new code under test.
 ## Building one
 
 ```
-buildFrontierCheckpoint(records)          -> auto frontier (maximal applied)
+buildFrontierCheckpoint(records)          -> auto frontier (maximal landed)
 buildFrontierCheckpoint(records, ids)     -> the named members' union closure
 ```
 
@@ -184,7 +191,7 @@ Python-vs-TS:
 - **delta-vs-full over frontier checkpoints across the whole corpus**:
   for every case, the auto-frontier checkpoint's `deriveDelta` equals the
   full `derive` byte-for-byte in both ports, its covered set equals the
-  applied set, and its pinned state equals the full derived state;
+  landed set, and its pinned state equals the full derived state;
 - **tail-dup over the whole corpus**: over every case's auto-frontier
   checkpoint, a tail record identical to a covered record engages and
   equals the full derive in both ports, and a divergent copy under the

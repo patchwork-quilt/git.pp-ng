@@ -6,9 +6,10 @@
 - **Record Set**: A collection of records, each containing:
   - `id`: Unique identifier for the record.
   - `parents`: A list of record IDs this record completed against — its ancestry.
-  - `kind`: One of `task` (a completion), `witness` (an observation), or `override` (a reasoned human decision).
+  - `kind`: One of `task` (a completion), `witness` (an observation), or `override` (a reasoned human decision) — plus the two meta kinds of the retraction law: `dispute` (a claim that another record's effects should not stand) and `settlement` (the ruling on a dispute). Meta records are never derivation steps; see "Retraction" in §2.
   - `effects`: A map of state keys to the values this record sets.
   - `reason`: Present on overrides — the stated reason, carried in the record.
+  - `author`: Optional on any record (a non-empty string). Read **only** by the retraction settlement pass, for authority; derivation itself never consults it.
 
 ### Outputs
 - **State**: The final state after processing all records, mapping keys to their resolved values.
@@ -69,6 +70,35 @@ Because the leaf is inherited from checkpoint v2, a mixed set — v1 records and
    - A **candidate** for a key is every record in the set whose `effects` set that key — tasks, witnesses, and overrides alike. Candidacy is about setting the key, not about being able to win it: only the candidates of the highest class present compete to win (step 4), but every setter is a candidate for labelling.
    - If, after resolution, there are two or more distinct values for a key, a conflict is emitted.
    - The losers are all candidates except the winner, which is the value chosen by the resolution algorithm. A displaced witness is therefore named a loser, never silently dropped: in corpus case `prop-base`, witness `w` sets `y` to 99 against task `b`'s 2, and the emitted conflict is `{key: "y", winner: "b", losers: ["w"]}`.
+
+### Retraction (dispute + settlement)
+
+The fold is two passes. A **settlement pass** runs first, over the record
+set alone: a `dispute` names a `target` and carries a mandatory `reason`;
+a `settlement` rules on a dispute (`upheld` / `rejected`) and bites only
+if **authoritative** — its author is the target's author, or captain-class
+(the author of an applied `override` in the set). Anonymous settlements
+never bite; an open, rejected, unauthoritative, or malformed dispute
+changes nothing at all.
+
+An upheld dispute **retracts** its target: the target's effects are
+voided and derivation re-runs, but the record keeps its graph position
+and its slot in `order` — descendants are not orphaned, domination still
+flows through it, and it lends no cleanliness (counts as neither an
+intent nor a witness ancestor). Disputes and settlements are never
+candidates and never appear in `order`. `derive()`'s output shape is
+unchanged; the pass is exposed as the sibling pure function
+`retraction_status` / `retractionStatus` returning
+`{disputes, retracted, contested}`.
+
+**Contested (Casey's amendment, 2026-11-02).** A retraction the target's
+author neither filed nor settled — a ratified third-party accusation —
+is marked **contested** on that surface, with the dispute/settlement
+provenance (`{record, dispute, settlement, disputed_by, settled_by}`).
+A retraction the author filed or settled is the author's own act and is
+never marked. The governing constraint is the ruling's own: the fold
+says only what the records can back up. Full semantics:
+`docs/RETRACTION-SPIKE.md`.
 
 ## 3. Determinism Argument
 

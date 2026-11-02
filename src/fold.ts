@@ -416,12 +416,15 @@ function cycleAffected(nodes: Set<string>, parents: ParentsMap): Set<string> {
 }
 
 /** Kahn's algorithm, always taking the smallest ready id: one canonical
- * order. Mirrors fold.py's _topological (indegree counts all parents). */
+ * order. Mirrors fold.py's _topological (indegree counts only parents
+ * inside the node set, so a subgraph gets its own canonical order; when
+ * every parent is inside — the only shape the pre-retraction fold passed
+ * — the count is parents.length). */
 function topological(nodes: Set<string>, parents: ParentsMap): string[] {
   const indeg: { [id: string]: number } = newStrMap();
   const children: { [id: string]: string[] } = newStrMap();
   for (const r of nodes) {
-    indeg[r] = parents[r].length;
+    indeg[r] = parents[r].filter((p) => nodes.has(p)).length;
     children[r] = [];
   }
   for (const r of nodes) {
@@ -598,6 +601,254 @@ export function deriveLegacy(records: FoldRecord[]): DeriveOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Retraction (dispute + settlement) — FOLD LAW as of Casey's ruling,
+// 2026-11-02 (adopting PR #16 with the contested amendment; see
+// docs/RETRACTION-SPIKE.md for the design record and the duel it came
+// from). Mirrors referee/fold.py's settlement pass exactly. Two new kinds:
+//
+//   dispute    {target, reason (mandatory), author?} — claims the target's
+//              effects should not stand. While OPEN (unsettled, settled
+//              "rejected", settled by nobody with authority, or malformed)
+//              it changes NOTHING in derivation.
+//   settlement {dispute, resolution: "upheld"|"rejected", author?} — the
+//              settling record. It bites only if AUTHORITATIVE: its author
+//              is the target record's author, or a captain-class author
+//              (authored an applied override in this set). Anonymous
+//              settlements never bite.
+//
+// An upheld dispute RETRACTS its target: effects voided, derivation
+// re-runs, but the target keeps its graph position — descendants are not
+// orphaned and not auto-disputed, and a retracted ancestor lends no
+// cleanliness (counts as neither intent nor witness). Meta records are
+// never derivation steps: excluded from `order`, from candidacy (any
+// `effects` on them are void), and from ancestry tallies, but present in
+// the parents graph. A settled-upheld dispute targeting a meta record
+// VOIDS it; voiding cycles have no well-founded basis and are inert.
+//
+// THE CONTESTED AMENDMENT (the ruling's condition): when a record is
+// retracted on a ratified accusation — an upheld dispute that its author
+// neither filed nor settled — the retraction is not silent: the record is
+// marked CONTESTED in the retraction surface, with the dispute/settlement
+// provenance. A retraction the author filed or settled themselves is a
+// plain retraction, never "contested" — the fold claims only what the
+// records back up.
+// ---------------------------------------------------------------------------
+
+const META_KINDS = new Set(["dispute", "settlement"]);
+
+function kindOf(rec: FoldRecord): unknown {
+  return (rec as { kind?: unknown }).kind;
+}
+
+function isMeta(rec: FoldRecord): boolean {
+  const k = kindOf(rec);
+  return typeof k === "string" && META_KINDS.has(k);
+}
+
+/** A record's author, if it carries a non-empty string one. Records in
+ * the shipped sets carry no author at all; absence means unattributed.
+ * Mirrors fold.py's _author. */
+function authorOf(rec: FoldRecord): string | null {
+  const a = (rec as { author?: unknown }).author;
+  return typeof a === "string" && a !== "" ? a : null;
+}
+
+export interface ContestedEntry {
+  record: string;
+  dispute: string;
+  settlement: string;
+  disputed_by: string | null;
+  settled_by: string | null;
+}
+
+interface SettlementPass {
+  retracted: Set<string>;
+  statuses: { [id: string]: string };
+  contested: ContestedEntry[];
+}
+
+/** First pass of the fold: compute, from the record set alone, which
+ * records are retracted, the status of every dispute, and which
+ * retractions are contested. Mirrors fold.py's _settlement_pass. */
+function settlementPass(
+  idx: { [id: string]: FoldRecord },
+  orphan: Set<string>,
+): SettlementPass {
+  const kind: { [id: string]: unknown } = newStrMap();
+  const author: { [id: string]: string | null } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    kind[rid] = kindOf(idx[rid]);
+    author[rid] = authorOf(idx[rid]);
+  }
+  const captains = new Set<string>();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] === "override" && !orphan.has(rid) && author[rid]) {
+      captains.add(author[rid] as string);
+    }
+  }
+
+  // Well-formed disputes: target names a record in the set, reason is a
+  // non-empty string. A dispute that never landed (orphan) is inert.
+  const targetOf: { [id: string]: string } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] !== "dispute") continue;
+    const rec = idx[rid] as { target?: unknown; reason?: unknown };
+    if (typeof rec.target === "string" &&
+        Object.prototype.hasOwnProperty.call(idx, rec.target) &&
+        typeof rec.reason === "string" && rec.reason !== "") {
+      targetOf[rid] = rec.target;
+    }
+  }
+  const live = new Set<string>(
+    Object.keys(targetOf).filter((d) => !orphan.has(d)),
+  );
+
+  // Candidate settlements per dispute: well-formed, landed, attributed,
+  // and authoritative for that dispute.
+  const settlementsOn: { [id: string]: string[] } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] !== "settlement" || orphan.has(rid) || !author[rid]) {
+      continue;
+    }
+    const rec = idx[rid] as { dispute?: unknown; resolution?: unknown };
+    const d = rec.dispute;
+    if (typeof d !== "string" ||
+        !Object.prototype.hasOwnProperty.call(targetOf, d)) {
+      continue;
+    }
+    if (rec.resolution !== "upheld" && rec.resolution !== "rejected") {
+      continue;
+    }
+    const tgtAuthor = author[targetOf[d]];
+    if (author[rid] === tgtAuthor || captains.has(author[rid] as string)) {
+      if (!settlementsOn[d]) settlementsOn[d] = [];
+      settlementsOn[d].push(rid);
+    }
+  }
+
+  // Dispute-dependency graph: d depends on every dispute whose status
+  // decides whether d or one of d's candidate settlements is voided.
+  const depMap: { [id: string]: Set<string> } = newStrMap();
+  for (const d of live) {
+    const out = new Set<string>();
+    for (const d2 of live) {
+      if (targetOf[d2] === d ||
+          (settlementsOn[d] ?? []).includes(targetOf[d2])) {
+        out.add(d2);
+      }
+    }
+    depMap[d] = out;
+  }
+
+  const isVoided = (x: string, status: { [id: string]: string }): boolean => {
+    for (const d2 of live) {
+      if (targetOf[d2] === x && status[d2] === "upheld") return true;
+    }
+    return false;
+  };
+
+  // Evaluate in dependency order (Kahn-style over the dependency graph).
+  // Whatever cannot be evaluated — it sits in, or depends on, a voiding
+  // cycle — has no well-founded settlement basis and stays inert.
+  const status: { [id: string]: string } = newStrMap();
+  const rulingOf: { [id: string]: string } = newStrMap();
+  const remaining = new Set<string>(live);
+  for (;;) {
+    const ready = [...remaining]
+      .filter((d) => [...depMap[d]].every(
+        (x) => Object.prototype.hasOwnProperty.call(status, x)))
+      .sort(cmpCodePoints);
+    if (ready.length === 0) break;
+    for (const d of ready) {
+      if (isVoided(d, status)) {
+        status[d] = "inert"; // voided dispute never bites
+      } else {
+        const cands = (settlementsOn[d] ?? []).filter(
+          (s) => !isVoided(s, status));
+        if (cands.length === 0) {
+          status[d] = "open";
+        } else {
+          const ruling = [...cands].sort(cmpCodePoints)[0]; // smallest id
+          rulingOf[d] = ruling;
+          status[d] = String(
+            (idx[ruling] as { resolution?: unknown }).resolution);
+        }
+      }
+      remaining.delete(d);
+    }
+  }
+
+  const statuses: { [id: string]: string } = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] === "dispute") statuses[rid] = status[rid] ?? "inert";
+  }
+  const retracted = new Set<string>();
+  for (const d of live) {
+    if (status[d] === "upheld" && !META_KINDS.has(String(kind[targetOf[d]]))) {
+      retracted.add(targetOf[d]);
+    }
+  }
+
+  // Contested: the ruling's amendment. A retraction is contested exactly
+  // when the record proves the author stood behind the work: the target
+  // HAS an author, the upheld dispute was filed by someone else (or by
+  // nobody attributable), and the ruling settlement was authored by
+  // someone else. If the author filed the dispute or settled it, the
+  // retraction is the author's own act and is never marked contested.
+  const contested: ContestedEntry[] = [];
+  for (const d of live) {
+    if (status[d] !== "upheld") continue;
+    const t = targetOf[d];
+    if (META_KINDS.has(String(kind[t]))) continue;
+    const tAuthor = author[t];
+    if (tAuthor === null) continue;
+    const s = rulingOf[d];
+    if (author[d] !== tAuthor && author[s] !== tAuthor) {
+      contested.push({
+        record: t,
+        dispute: d,
+        settlement: s,
+        disputed_by: author[d],
+        settled_by: author[s],
+      });
+    }
+  }
+  contested.sort((a, b) =>
+    cmpCodePoints(a.record, b.record) || cmpCodePoints(a.dispute, b.dispute));
+  return { retracted, statuses, contested };
+}
+
+/**
+ * The settlement pass as data — a sibling surface to witnessFreshness,
+ * not a change to derive()'s output shape (TypeScript port of the
+ * referee's retraction_status; checked against it by the conformance
+ * harness).
+ *
+ * Returns {disputes: {disputeId: status}, retracted: [recordId],
+ * contested: [entry]} where status is "open" (no authoritative ruling
+ * yet), "upheld"/"rejected" (the smallest-id authoritative, unvoided
+ * settlement's ruling), or "inert" (malformed, orphaned, voided, or
+ * cycle-entangled — the dispute cannot bite). Each contested entry is
+ * {record, dispute, settlement, disputed_by, settled_by}: the provenance
+ * of a retraction the target's author neither filed nor settled (Casey's
+ * contested amendment, 2026-11-02 — a ratified accusation is marked,
+ * never a silent void). Pure function of the record set, like derive().
+ */
+export function retractionStatus(records: FoldRecord[]): {
+  disputes: { [id: string]: string };
+  retracted: string[];
+  contested: ContestedEntry[];
+} {
+  const { idx, orphan } = prepareDerive(records);
+  const { retracted, statuses, contested } = settlementPass(idx, orphan);
+  return {
+    disputes: statuses,
+    retracted: [...retracted].sort(cmpCodePoints),
+    contested,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Memoised ancestry engine (production derive).
 //
 // Same semantics as deriveLegacy — DESIGN.md is the spec, byte-for-byte —
@@ -622,10 +873,20 @@ interface PreparedDerive {
   applied: string[];
   order: string[];
   orphan: Set<string>;
+  /** Records whose effects the settlement pass voided (subset of applied:
+   * retracted records keep their order slots; they are never candidates). */
+  retracted: Set<string>;
+  /** Topological order over ALL landed records (meta included) — the
+   * ancestry index spans the landed graph so transitivity runs through
+   * meta and retracted records exactly as the referee's does. */
+  landedOrder: string[];
 }
 
 /** The front half of the fold (canonical index, orphan propagation, cycle
- * exclusion, canonical Kahn order) — logic identical to deriveLegacy's. */
+ * exclusion, canonical Kahn order) — the index/orphan half is logic
+ * identical to deriveLegacy's; the settlement pass and the meta exclusion
+ * from `applied` run here, so every consumer of the prepared set (derive,
+ * and through it the delta path) folds under the same retraction law. */
 function prepareDerive(records: FoldRecord[]): PreparedDerive {
   const idx = indexRecords([...records]);
   const ids = new Set<string>(Object.keys(idx));
@@ -670,11 +931,22 @@ function prepareDerive(records: FoldRecord[]): PreparedDerive {
   for (const rid of ids) if (!orphan.has(rid)) nonOrphan.add(rid);
   for (const rid of cycleAffected(nonOrphan, parents)) orphan.add(rid);
 
+  // The settlement pass runs over the whole landed set (orphan computed
+  // above over all records, meta included); meta records are consumed by
+  // it and are never derivation steps, so `applied` excludes them.
+  // Retracted records stay in `applied`/`order` — they keep their slots;
+  // derive() excludes them from candidacy via `retracted`.
+  const { retracted } = settlementPass(idx, orphan);
   const applied: string[] = [];
-  for (const rid of ids) if (!orphan.has(rid)) applied.push(rid);
+  for (const rid of ids) {
+    if (!orphan.has(rid) && !isMeta(idx[rid])) applied.push(rid);
+  }
   applied.sort(cmpCodePoints);
   const order = topological(new Set<string>(applied), parents);
-  return { idx, parents, applied, order, orphan };
+  const landed: string[] = [];
+  for (const rid of ids) if (!orphan.has(rid)) landed.push(rid);
+  const landedOrder = topological(new Set<string>(landed), parents);
+  return { idx, parents, applied, order, orphan, retracted, landedOrder };
 }
 
 const POP8 = new Uint8Array(256);
@@ -713,6 +985,7 @@ function buildAncestry(
   order: string[],
   parents: ParentsMap,
   idx: { [id: string]: FoldRecord },
+  tallyExclude?: Set<string>,
 ): AncestryIndex {
   const n = order.length;
   const words = Math.ceil(n / 32);
@@ -722,6 +995,11 @@ function buildAncestry(
   const witnessMask = new Uint32Array(words);
   for (let i = 0; i < n; i++) {
     pos.set(order[i], i);
+    // Records in tallyExclude (meta and retracted records, when the
+    // caller passes them) set NEITHER mask bit: they are present in the
+    // ancestry bits — domination runs through them — but lend no
+    // cleanliness, exactly as the referee's tallies treat them.
+    if (tallyExclude && tallyExclude.has(order[i])) continue;
     const r = rankOf(idx[order[i]]);
     if (r < WITNESS_RANK) intentMask[i >> 5] |= 1 << (i & 31);
     else witnessMask[i >> 5] |= 1 << (i & 31);
@@ -754,12 +1032,24 @@ function rowPopcount(anc: AncestryIndex, row: number): number {
 }
 
 export function derive(records: FoldRecord[]): DeriveOutput {
-  const { idx, parents, applied, order, orphan } = prepareDerive(records);
-  const anc = buildAncestry(order, parents, idx);
+  const { idx, parents, applied, order, orphan, retracted, landedOrder } =
+    prepareDerive(records);
+  // Ancestry spans the whole landed graph — meta and retracted records
+  // included — so domination transitivity runs through them exactly as
+  // through any record (the referee computes its ancestor sets the same
+  // way); only the cleanliness tallies treat them specially, via the
+  // tally exclusion below.
+  const tallyExclude = new Set<string>();
+  for (const rid of landedOrder) {
+    if (isMeta(idx[rid]) || retracted.has(rid)) tallyExclude.add(rid);
+  }
+  const anc = buildAncestry(landedOrder, parents, idx, tallyExclude);
 
-  // Who sets each key, among applied records only (as deriveLegacy).
+  // Who sets each key, among applied records only. A retracted record's
+  // effects are voided: it is never a candidate, never a winner or loser.
   const setters: { [key: string]: Set<string> } = newStrMap();
   for (const rid of applied) {
+    if (retracted.has(rid)) continue;
     for (const k of Object.keys(effectsOf(idx[rid]))) {
       if (!setters[k]) setters[k] = new Set<string>();
       setters[k].add(rid);
@@ -1067,6 +1357,21 @@ export function verifyCheckpoint(
   if (!v2) return stateOk;
   if (!stateOk) return "MISMATCH";
   const actualRoot = checkpointRoot(records, members);
+  // RULING — STATE-ONLY stands (Casey, 2026-11-02, adopting the lane's
+  // recommendation): when the state matches but the closure root does
+  // not, the verdict is "STATE-ONLY" — this is a different state, full
+  // stop. Verification does NOT accuse a shrunk or swapped closure of
+  // tampering ("MISMATCH"), because a closure root alone cannot back
+  // that claim up: it proves difference, not substitution.
+  //
+  // TAILOR-FIT: this return is the decision point. To rule MISMATCH for
+  // the root-differs case instead, the checkpoint format must first pin
+  // the closure's size and/or member id-set alongside the root (a small
+  // format addition in checkpointRoot / buildCheckpoint and in EVERY
+  // port of this fold), verification must compare the pin here, and
+  // only a pin failure — not a root failure — may read as MISMATCH.
+  // Until such a pin exists in the format, keep this verdict STATE-ONLY:
+  // say only what the record proves.
   return actualRoot === String(expectedRoot) ? "VERIFIED" : "STATE-ONLY";
 }
 
@@ -1121,11 +1426,15 @@ export function buildCheckpoint(
  * root computed over C by the identical construction.
  *
  * With `frontierIds` omitted, the frontier is computed as the maximal
- * APPLIED records (applied records no other applied record descends from).
- * For that frontier, C is exactly derive's applied set — every applied
- * record is an ancestor-or-self of a maximal applied record, and every
- * ancestor of an applied record is applied — so the pinned state is the
- * full derived state of `records`, not a partial state.
+ * LANDED records (landed records no other landed record descends from;
+ * landed = present and non-orphan, meta records included — a landed
+ * settlement must sit inside the frontier's closure, or the checkpoint
+ * would pin a state that ignores the ruling). For that frontier, C is
+ * exactly the landed set — every landed record is an ancestor-or-self
+ * of a maximal landed record, and every ancestor of a landed record is
+ * landed — so the pinned state is the full derived state of `records`,
+ * not a partial state. (Before the retraction law, landed == applied
+ * and the older "maximal applied" formulation named the same set.)
  *
  * Canonical form: a one-member frontier is emitted in the STRING form, so
  * the result is byte-identical to buildCheckpoint at that record; the array
@@ -1143,17 +1452,22 @@ export function buildFrontierCheckpoint(
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   let members: string[];
   if (frontierIds === undefined) {
-    const applied = derive(records).order;
-    if (applied.length === 0) return null;
-    const appliedSet = new Set<string>(applied);
-    const hasAppliedChild = new Set<string>();
-    for (const rid of applied) {
+    // Maximal landed records (see the docstring): the member set must
+    // range over meta records too, because a settlement is typically a
+    // leaf — a frontier of maximal APPLIED records would leave a landed
+    // ruling outside every member closure.
+    const prep = prepareDerive(records);
+    if (prep.order.length === 0) return null;
+    const landed = Object.keys(idx).filter((rid) => !prep.orphan.has(rid));
+    const landedSet = new Set<string>(landed);
+    const hasLandedChild = new Set<string>();
+    for (const rid of landed) {
       for (const p of parents[rid]) {
-        if (appliedSet.has(p)) hasAppliedChild.add(p);
+        if (landedSet.has(p)) hasLandedChild.add(p);
       }
     }
-    members = applied
-      .filter((r) => !hasAppliedChild.has(r))
+    members = landed
+      .filter((r) => !hasLandedChild.has(r))
       .sort(cmpCodePoints);
   } else {
     const norm = frontierMembers(frontierIds);

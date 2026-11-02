@@ -454,6 +454,419 @@ CKPT_V2_EXPECTED = {
     "ckpt-v2-reason-tamper": "STATE-ONLY",
 }
 
+# --- RETRACTION (dispute + settlement) — fold law (Casey's ruling, --------
+# 2026-11-02) ----------------------------------------------------------------
+# Adopted from PR #16 (the retraction spike) WITH the contested amendment:
+# a retraction the target's author neither filed nor settled is marked
+# CONTESTED on the retraction surface, with dispute/settlement provenance
+# — a ratified accusation is never a silent void. See
+# docs/RETRACTION-SPIKE.md for the design record. The differential
+# (TS == Python, full retraction surface included) runs on every case as
+# usual; RET_EXPECTED additionally pins WHICH answer is correct for the
+# bite cases, RET_CONTESTED pins the contested markings, and the
+# sprinkling block at the end of this section proves an UNSETTLED dispute
+# changes NOTHING over the whole pre-existing corpus: derive()
+# byte-identical, nothing retracted, nothing contested.
+
+def D(id, parents, target, reason="filed in error", author=None, effects=None):
+    d = {"id": id, "parents": parents, "kind": "dispute",
+         "effects": effects if effects is not None else {},
+         "target": target, "reason": reason}
+    if author is not None:
+        d["author"] = author
+    return d
+
+
+def S(id, parents, dispute, resolution, author=None, reason=None):
+    d = {"id": id, "parents": parents, "kind": "settlement",
+         "effects": {}, "dispute": dispute, "resolution": resolution}
+    if author is not None:
+        d["author"] = author
+    if reason is not None:
+        d["reason"] = reason
+    return d
+
+
+# Shared authored base: c carries a bad value x and contests k; e beats d
+# for k ONLY because e's ancestry runs through c (intent 2 vs 1) — the
+# design duel's failure shape. Retracting c must flip k to d.
+AB = [
+    R("g", [], "task", {"k": 0}, author="amy"),
+    R("c", ["g"], "task", {"x": "bad", "k": 5}, author="amy"),
+    R("e", ["c"], "task", {"k": "e-val"}, author="bob"),
+    R("d", ["g"], "task", {"k": "d-val"}, author="bob"),
+]
+add("ret-open", AB + [D("dsp", ["c"], "c", author="bob")], ats=["e"])
+add("ret-self-upheld",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", ["dsp"], "dsp", "upheld", author="amy")], ats=["e"])
+add("ret-self-rejected",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", ["dsp"], "dsp", "rejected", author="amy")], ats=["e"])
+add("ret-nobody-upheld",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", ["dsp"], "dsp", "upheld", author="mallory")], ats=["e"])
+add("ret-anon-settlement",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", ["dsp"], "dsp", "upheld")], ats=["e"])
+# The captain (an override's author) ratifies a THIRD PARTY's dispute
+# against a record its author still stands behind. The mechanics retract
+# it; Casey's contested amendment (2026-11-02) is what makes the fold SAY
+# so: ret-captain-upheld is pinned CONTESTED in RET_CONTESTED below.
+ABC = AB + [R("ov", ["g"], "override", {"z": 1}, author="cap",
+              reason="captain's standing order")]
+add("ret-captain-upheld",
+    ABC + [D("dsp", ["c"], "c", author="mallory"),
+           S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["e"])
+add("ret-captain-rejected",
+    ABC + [D("dsp", ["c"], "c", author="mallory"),
+           S("stl", ["dsp"], "dsp", "rejected", author="cap")], ats=["e"])
+# The target's author rebuts a third party's dispute about their record.
+add("ret-author-rebuts",
+    AB + [D("dsp", ["c"], "c", author="mallory"),
+          S("stl", ["dsp"], "dsp", "rejected", author="amy")], ats=["e"])
+# Dispute of dispute: dsp (settled upheld, c retracted) is itself disputed
+# and that dispute is upheld by dsp's own author -> dsp voided, c restored.
+add("ret-dispute-of-dispute",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", ["dsp"], "dsp", "upheld", author="amy"),
+          D("dsp2", ["stl"], "dsp", author="amy"),
+          S("stl2", ["dsp2"], "dsp2", "upheld", author="bob")], ats=["e"])
+# Dispute of settlement: the settlement that retracted c is voided by an
+# upheld dispute (settled by the settlement's own author) -> c restored.
+add("ret-dispute-of-settlement",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", ["dsp"], "dsp", "upheld", author="amy"),
+          D("dsp2", ["stl"], "stl", author="bob"),
+          S("stl2", ["dsp2"], "dsp2", "upheld", author="amy")], ats=["e"])
+# A two-level chain: dB's upheld dispute voids sA, so dA (whose only ruling
+# was sA) falls back to open and the original retraction stands.
+add("ret-chain-voiding",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("dsp0", ["c"], "c", author="bob"),
+          S("stl0", ["dsp0"], "dsp0", "upheld", author="cap"),
+          D("dA", ["stl0"], "stl0", author="bob"),
+          S("sA", ["dA"], "dA", "upheld", author="cap"),
+          D("dB", ["sA"], "sA", author="bob"),
+          S("sB", ["dB"], "dB", "upheld", author="cap")], ats=["e"])
+# A voiding ring: d1->s2, d2->s3, d3->s1 (si settles di). Every dispute's
+# settlement basis is cyclic, so NO dispute in the ring can bite.
+add("ret-voiding-cycle",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("d1", ["g"], "s2", author="bob"), S("s1", ["d1"], "d1", "upheld", author="cap"),
+          D("d2", ["g"], "s3", author="bob"), S("s2", ["d2"], "d2", "upheld", author="cap"),
+          D("d3", ["g"], "s1", author="bob"), S("s3", ["d3"], "d3", "upheld", author="cap")],
+    ats=["e"])
+# Conflicting authoritative settlements on ONE dispute: smallest id rules.
+add("ret-settlement-conflict-rejected",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("dsp", ["c"], "c", author="bob"),
+          S("stl-a", ["dsp"], "dsp", "rejected", author="cap"),
+          S("stl-b", ["dsp"], "dsp", "upheld", author="cap")], ats=["e"])
+add("ret-settlement-conflict-upheld",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("dsp", ["c"], "c", author="bob"),
+          S("stl-a", ["dsp"], "dsp", "upheld", author="cap"),
+          S("stl-b", ["dsp"], "dsp", "rejected", author="cap")], ats=["e"])
+# Disputing the captain: an override is a valid target; only a captain-class
+# settlement can retract it, and then the key falls back to the task pool.
+OVR = [
+    R("g", [], "task", {"k": 0}, author="amy"),
+    R("task-a", ["g"], "task", {"timeout": 30}, author="amy"),
+    R("task-b", ["g"], "task", {"timeout": 60}, author="bob"),
+    R("ov1", ["task-a", "task-b"], "override", {"timeout": 45},
+      author="cap", reason="captain: 45 is the safe value"),
+]
+add("ret-target-is-override",
+    OVR + [D("dsp", ["ov1"], "ov1", author="bob"),
+           S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["ov1"])
+add("ret-override-dispute-nobody",
+    OVR + [D("dsp", ["ov1"], "ov1", author="bob"),
+           S("stl", ["dsp"], "dsp", "upheld", author="mallory")], ats=["ov1"])
+# Descendants of a retracted record: not orphaned, not auto-disputed —
+# their own effects stand, and domination still flows through the
+# retracted record's graph position.
+add("ret-descendant-stands",
+    [R("g", [], "task", {"k": 0}, author="amy"),
+     R("t", ["g"], "task", {"bad": 1}, author="amy"),
+     R("x", ["t"], "task", {"own": "x-val"}, author="bob"),
+     D("dsp", ["t"], "t", author="amy"),
+     S("stl", ["dsp"], "dsp", "upheld", author="amy")], ats=["x"])
+add("ret-domination-through-retracted",
+    [R("g", [], "task", {"k": 0}, author="amy"),
+     R("p", ["g"], "task", {"k": "p"}, author="bob"),
+     R("t", ["p"], "task", {"other": 1}, author="amy"),
+     R("q", ["t"], "task", {"k": "q"}, author="bob"),
+     D("dsp", ["t"], "t", author="amy"),
+     S("stl", ["dsp"], "dsp", "upheld", author="amy")], ats=["q"])
+# Orphaned meta records never landed, so they cannot bite.
+add("ret-orphan-dispute",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("dsp", ["ghost"], "c", author="bob"),
+          S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["e"])
+add("ret-orphan-settlement",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", ["ghost"], "dsp", "upheld", author="amy")], ats=["e"])
+# Malformed meta records are inert: missing target, empty reason, bad
+# resolution value, settlement naming a non-dispute or a missing dispute.
+add("ret-malformed-disputes",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("dsp-missing", ["g"], "nope", author="bob"),
+          D("dsp-noreason", ["g"], "c", reason="", author="bob"),
+          S("stl1", ["dsp-missing"], "dsp-missing", "upheld", author="cap"),
+          S("stl2", ["dsp-noreason"], "dsp-noreason", "upheld", author="cap")],
+    ats=["e"])
+add("ret-malformed-settlements",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl-bad-res", ["dsp"], "dsp", "maybe", author="amy"),
+          S("stl-notdispute", ["dsp"], "c", "upheld", author="amy"),
+          S("stl-missing", ["dsp"], "ghost-dsp", "upheld", author="amy")],
+    ats=["e"])
+# A dispute's own `effects` are void: meta records are never candidates.
+# (The pre-retraction fold ranked unknown kinds as witnesses — a dispute
+# carrying {"rogue": 1} would have SET rogue. The law closes that.)
+add("ret-dispute-effects-void",
+    AB + [D("dsp", ["c"], "c", author="bob", effects={"rogue": 1, "k": "sneaky"})],
+    ats=["e"])
+# Multiple disputes on one target are independent: any one upheld bites;
+# a rejected one does not shield the target from another.
+add("ret-multiple-disputes-upheld",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("dsp1", ["c"], "c", author="bob"),
+          D("dsp2", ["c"], "c", author="mallory"),
+          S("stl2", ["dsp2"], "dsp2", "upheld", author="cap")], ats=["e"])
+add("ret-multiple-disputes-rejected-open",
+    AB + [R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+          D("dsp1", ["c"], "c", author="bob"),
+          S("stl1", ["dsp1"], "dsp1", "rejected", author="cap"),
+          D("dsp2", ["c"], "c", author="mallory")], ats=["e"])
+# A settlement cites its dispute by FIELD; it need not parent it. (Parentage
+# still matters for checkpoint closures — see the two cases below.)
+add("ret-settlement-field-citation",
+    AB + [D("dsp", ["c"], "c", author="bob"),
+          S("stl", [], "dsp", "upheld", author="amy")], ats=["e"])
+# Unattributed sets are dispute-inert: with no author on the target and no
+# attributed override, NO settlement can be authoritative. (This is the
+# backwards-compatibility story for every record set shipped before the
+# law — including the live projects.)
+add("ret-unattributed-inert",
+    [R("g", [], "task", {"k": 0}),
+     R("c", ["g"], "task", {"x": "bad"}),
+     R("ov", ["g"], "override", {"z": 1}, reason="standing"),
+     D("dsp", ["c"], "c", author="bob"),
+     S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["c"])
+# A witness is a valid target too: an upheld dispute retracts the
+# observation's effects (the ambient key leaves the state) — the record
+# itself stays, and stays a witness for freshness purposes.
+add("ret-target-is-witness",
+    [R("g", [], "task", {}, author="amy"),
+     R("w", ["g"], "witness", {"env.disk": 93}, author="bob"),
+     R("t", ["g"], "task", {"k": 1}, author="amy"),
+     R("ov", ["g"], "override", {"z": 1}, author="cap", reason="standing"),
+     D("dsp", ["w"], "w", reason="sensor miscalibrated", author="amy"),
+     S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["t"])
+# --- The contested amendment (Casey's ruling, 2026-11-02) -------------------
+# An anonymous accuser, ratified by the captain: the record proves the
+# author (amy) neither filed nor settled — contested, disputed_by null.
+add("ret-contested-anon-dispute",
+    ABC + [D("dsp", ["c"], "c"),
+           S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["e"])
+# The author files against her own record; the captain settles upheld.
+# The retraction stands, but it is the author's own accusation — the fold
+# must NOT mark it contested.
+add("ret-author-files-captain-settles",
+    ABC + [D("dsp", ["c"], "c", author="amy"),
+           S("stl", ["dsp"], "dsp", "upheld", author="cap")], ats=["e"])
+# Two disputes on one target: one the author settled herself (a plain
+# retraction), one a stranger filed and the captain ratified (contested).
+# Only the second may be marked.
+add("ret-contested-two-disputes",
+    ABC + [D("dsp1", ["c"], "c", author="bob"),
+           S("stl1", ["dsp1"], "dsp1", "upheld", author="amy"),
+           D("dsp2", ["c"], "c", author="mallory"),
+           S("stl2", ["dsp2"], "dsp2", "upheld", author="cap")], ats=["e"])
+# Determinism: the same record SET as ret-captain-upheld, listed in
+# reverse order, must produce the identical contested marking — the
+# surface is a pure function of the set, never of its presentation.
+add("ret-contested-shuffled",
+    list(reversed(ABC + [D("dsp", ["c"], "c", author="mallory"),
+                         S("stl", ["dsp"], "dsp", "upheld", author="cap")])),
+    ats=["e"])
+# Checkpoint closures see only the settlements inside them: with the
+# settlement parented into the chain, the closure at x derives the
+# retracted state; with it outside, the closure honestly derives the
+# unretracted one (set-relativity, the v1/v2 doctrine unchanged).
+_CK = [R("g", [], "task", {"k": 0}, author="amy"),
+       R("t", ["g"], "task", {"k": "bad"}, author="amy"),
+       R("x", ["t"], "task", {"j": 1}, author="bob")]
+CASES.append({
+    "name": "ret-checkpoint-inside",
+    "records": _CK + [D("dsp", ["t"], "t", author="bob"),
+                      S("stl", ["dsp"], "dsp", "upheld", author="amy"),
+                      R("x2", ["x", "stl"], "task", {"j": 2}, author="bob")],
+    "probes": [{"at": "x2", "state": {"k": 0, "j": 2}},
+               {"at": "x2", "state": {"j": 2, "k": "bad"}}],
+})
+CASES.append({
+    "name": "ret-checkpoint-outside",
+    "records": _CK + [D("dsp", ["t"], "t", author="bob"),
+                      S("stl", [], "dsp", "upheld", author="amy")],
+    "probes": [{"at": "x", "state": {"j": 1, "k": "bad"}},
+               {"at": "x", "state": {"j": 1}}],
+})
+
+# Pinned answers for the bite cases (state + retraction surface), checked
+# in main() against the referee — the differential alone only proves the
+# ports agree, not that they agree on the RIGHT thing.
+RET_EXPECTED = {
+    "ret-open": ({"k": "e-val", "x": "bad"}, {"dsp": "open"}, []),
+    "ret-self-upheld": ({"k": "d-val"}, {"dsp": "upheld"}, ["c"]),
+    "ret-self-rejected": ({"k": "e-val", "x": "bad"}, {"dsp": "rejected"}, []),
+    "ret-nobody-upheld": ({"k": "e-val", "x": "bad"}, {"dsp": "open"}, []),
+    "ret-anon-settlement": ({"k": "e-val", "x": "bad"}, {"dsp": "open"}, []),
+    "ret-captain-upheld": ({"k": "d-val", "z": 1}, {"dsp": "upheld"}, ["c"]),
+    "ret-captain-rejected": ({"k": "e-val", "x": "bad", "z": 1},
+                             {"dsp": "rejected"}, []),
+    "ret-author-rebuts": ({"k": "e-val", "x": "bad"}, {"dsp": "rejected"}, []),
+    "ret-dispute-of-dispute": ({"k": "e-val", "x": "bad"},
+                               {"dsp": "inert", "dsp2": "upheld"}, []),
+    "ret-dispute-of-settlement": ({"k": "e-val", "x": "bad"},
+                                  {"dsp": "open", "dsp2": "upheld"}, []),
+    "ret-chain-voiding": ({"k": "d-val", "z": 1},
+                          {"dsp0": "upheld", "dA": "open", "dB": "upheld"},
+                          ["c"]),
+    "ret-voiding-cycle": ({"k": "e-val", "x": "bad", "z": 1},
+                          {"d1": "inert", "d2": "inert", "d3": "inert"}, []),
+    "ret-settlement-conflict-rejected": ({"k": "e-val", "x": "bad", "z": 1},
+                                         {"dsp": "rejected"}, []),
+    "ret-settlement-conflict-upheld": ({"k": "d-val", "z": 1},
+                                       {"dsp": "upheld"}, ["c"]),
+    "ret-target-is-override": ({"k": 0, "timeout": 30},
+                               {"dsp": "upheld"}, ["ov1"]),
+    "ret-override-dispute-nobody": ({"k": 0, "timeout": 45},
+                                    {"dsp": "open"}, []),
+    "ret-descendant-stands": ({"k": 0, "own": "x-val"},
+                              {"dsp": "upheld"}, ["t"]),
+    "ret-domination-through-retracted": ({"k": "q"},
+                                         {"dsp": "upheld"}, ["t"]),
+    "ret-orphan-dispute": ({"k": "e-val", "x": "bad", "z": 1},
+                           {"dsp": "inert"}, []),
+    "ret-orphan-settlement": ({"k": "e-val", "x": "bad"},
+                              {"dsp": "open"}, []),
+    "ret-malformed-disputes": ({"k": "e-val", "x": "bad", "z": 1},
+                               {"dsp-missing": "inert", "dsp-noreason": "inert"},
+                               []),
+    "ret-malformed-settlements": ({"k": "e-val", "x": "bad"},
+                                  {"dsp": "open"}, []),
+    "ret-dispute-effects-void": ({"k": "e-val", "x": "bad"},
+                                 {"dsp": "open"}, []),
+    "ret-multiple-disputes-upheld": ({"k": "d-val", "z": 1},
+                                     {"dsp1": "open", "dsp2": "upheld"},
+                                     ["c"]),
+    "ret-multiple-disputes-rejected-open": (
+        {"k": "e-val", "x": "bad", "z": 1},
+        {"dsp1": "rejected", "dsp2": "open"}, []),
+    "ret-settlement-field-citation": ({"k": "d-val"}, {"dsp": "upheld"}, ["c"]),
+    "ret-unattributed-inert": ({"k": 0, "x": "bad", "z": 1},
+                               {"dsp": "open"}, []),
+    "ret-target-is-witness": ({"k": 1, "z": 1}, {"dsp": "upheld"}, ["w"]),
+    "ret-contested-anon-dispute": ({"k": "d-val", "z": 1},
+                                   {"dsp": "upheld"}, ["c"]),
+    "ret-author-files-captain-settles": ({"k": "d-val", "z": 1},
+                                         {"dsp": "upheld"}, ["c"]),
+    "ret-contested-two-disputes": ({"k": "d-val", "z": 1},
+                                   {"dsp1": "upheld", "dsp2": "upheld"}, ["c"]),
+    "ret-contested-shuffled": ({"k": "d-val", "z": 1},
+                               {"dsp": "upheld"}, ["c"]),
+}
+
+# Pinned CONTESTED markings (the amendment): a retraction is contested
+# exactly when the target has an author who neither filed the upheld
+# dispute nor authored the ruling settlement. Every other retraction —
+# self-filed, self-settled, or against an unattributed record — must
+# produce NO entry: the fold claims only what the records back up.
+RET_CONTESTED = {
+    "ret-captain-upheld": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    "ret-chain-voiding": [
+        {"record": "c", "dispute": "dsp0", "settlement": "stl0",
+         "disputed_by": "bob", "settled_by": "cap"}],
+    "ret-multiple-disputes-upheld": [
+        {"record": "c", "dispute": "dsp2", "settlement": "stl2",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    "ret-settlement-conflict-upheld": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl-a",
+         "disputed_by": "bob", "settled_by": "cap"}],
+    "ret-target-is-witness": [
+        {"record": "w", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": "amy", "settled_by": "cap"}],
+    "ret-contested-anon-dispute": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": None, "settled_by": "cap"}],
+    "ret-contested-two-disputes": [
+        {"record": "c", "dispute": "dsp2", "settlement": "stl2",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    "ret-contested-shuffled": [
+        {"record": "c", "dispute": "dsp", "settlement": "stl",
+         "disputed_by": "mallory", "settled_by": "cap"}],
+    # NOT contested: the author settled it, filed it, or did both; a
+    # settlement authored BY the target's author (the captain retracting
+    # his own override) is likewise the author's own act.
+    "ret-self-upheld": [],
+    "ret-author-files-captain-settles": [],
+    "ret-descendant-stands": [],
+    "ret-domination-through-retracted": [],
+    "ret-settlement-field-citation": [],
+    "ret-target-is-override": [],
+    "ret-open": [],
+}
+
+# --- Sprinkled inertness: EVERY pre-existing case, three ways --------------
+# For each named case above (plus a stress sample), add an open dispute, a
+# rejected-by-nobody dispute, and an upheld-by-nobody dispute. The added
+# settlements are deliberately NON-authoritative (the base records carry
+# no authors, so there is no target author to match and no captain), which
+# is exactly the claim: an unsettled dispute — including one a stranger
+# tried to settle — changes NOTHING. main() asserts referee derive() is
+# byte-identical to the base case and nothing is retracted or contested;
+# the TS differential on the sprinkled cases themselves proves parity.
+SPRINKLE_PAIRS = []
+
+
+def _sprinkle(base_name, records):
+    if not records:
+        return
+    target = records[0]["id"]
+    variants = {
+        "open": [D(f"spr-dsp", [], target, author="spr-filer")],
+        "rejected": [D(f"spr-dsp", [], target, author="spr-filer"),
+                     S(f"spr-stl", [], "spr-dsp", "rejected",
+                       author="spr-settler")],
+        "nobody-upheld": [D(f"spr-dsp", [], target, author="spr-filer"),
+                          S(f"spr-stl", [], "spr-dsp", "upheld",
+                            author="spr-settler")],
+    }
+    for tag, extra in variants.items():
+        nm = f"spr-{base_name}-{tag}"
+        CASES.append({"name": nm,
+                      "records": [dict(r) for r in records] +
+                                 [dict(r) for r in extra],
+                      "probes": []})
+        SPRINKLE_PAIRS.append((base_name, nm))
+
+
+_sprinkle_bases = [c for c in CASES
+                   if not c["name"].startswith(("stress-", "ret-", "spr-"))
+                   and c["name"] != "ckpt-bigint-domain"]
+for _c in _sprinkle_bases:
+    _sprinkle(_c["name"], _c["records"])
+for _i in range(25):
+    _c = next(c for c in CASES if c["name"] == f"stress-dag{_i}")
+    _sprinkle(_c["name"], _c["records"])
+
+
+
 # --- FRONTIER CHECKPOINTS (docs/FRONTIER-CHECKPOINTS.md) -------------------
 # The set-form generalisation of checkpoint v2: `at` may be a LIST of
 # frontier ids pinning the union of their ancestor closures, root computed
@@ -1369,6 +1782,13 @@ def main():
         if got.get("freshness") != exp_fresh:
             divergences.append(
                 (name, f"freshness differs: py={exp_fresh} ts={got.get('freshness')}"))
+        # Retraction surface: dispute statuses, the retracted set, and the
+        # contested markings must be identical across ports on EVERY case.
+        exp_ret = ref.retraction_status([dict(r) for r in case["records"]])
+        if got.get("retraction") != exp_ret:
+            divergences.append(
+                (name, f"retraction differs: py={exp_ret} "
+                       f"ts={got.get('retraction')}"))
         # checkpoint v2: every applied id's closure-root digest must be identical
         # across ports (SPIKE).
         exp_roots = {rid: ref.checkpoint_root([dict(r) for r in case["records"]], rid)
@@ -1395,8 +1815,8 @@ def main():
         if got.get("deltas") != exp_deltas:
             divergences.append((name, "delta derivation differs across ports"))
         # FRONTIER DERIVATION: the case's AUTO frontier checkpoint (maximal
-        # applied records) must (a) cover exactly the applied set — the
-        # C == applied-set theorem — with the full derived state pinned,
+        # landed records) must (a) cover exactly the landed set — the
+        # C == landed-set theorem — with the full derived state pinned,
         # (b) delta-derive to the FULL derive byte-for-byte, and (c) be
         # built identically by the TS port (members, root, coverage, delta).
         fcp = ref.build_frontier_checkpoint([dict(r) for r in case["records"]])
@@ -1411,9 +1831,12 @@ def main():
                 (name, "frontier checkpoint: referee built one, TS none"))
             return
         frontier_deltas += 1
-        if {r["id"] for r in fcp["closure"]} != set(exp_derive["order"]):
+        _landed = (set(ref._index([ref._canonical_record(r)
+                                   for r in case["records"]]))
+                   - set(exp_derive["orphans"]))
+        if {r["id"] for r in fcp["closure"]} != _landed:
             divergences.append(
-                (name, "frontier covered set != applied set"))
+                (name, "frontier covered set != landed set"))
         if fcp["state"] != exp_derive["state"]:
             divergences.append(
                 (name, "frontier pinned state != full derived state"))
@@ -1774,6 +2197,41 @@ def main():
                            if k in _c["probes"][0]})
             assert _got == _want, \
                 f"{_nm}: expected {_want}, referee gave {_got}"
+        # RETRACTION (fold law, 2026-11-02): pin WHICH answer is correct
+        # for the bite cases — state, dispute statuses, retracted set —
+        # and pin the CONTESTED markings of the amendment: a retraction
+        # the target's author neither filed nor settled is marked, with
+        # provenance; every other retraction is not.
+        for _nm, (_state, _statuses, _retracted) in RET_EXPECTED.items():
+            _c = _by_name[_nm]
+            _recs = [dict(r) for r in _c["records"]]
+            _out = derive(_recs)
+            assert _out["state"] == _state, \
+                f"{_nm}: state {_out['state']} != pinned {_state}"
+            _rs = ref.retraction_status(_recs)
+            assert _rs["disputes"] == _statuses, \
+                f"{_nm}: disputes {_rs['disputes']} != pinned {_statuses}"
+            assert _rs["retracted"] == _retracted, \
+                f"{_nm}: retracted {_rs['retracted']} != pinned {_retracted}"
+        for _nm, _want_contested in RET_CONTESTED.items():
+            _c = _by_name[_nm]
+            _rs = ref.retraction_status([dict(r) for r in _c["records"]])
+            assert _rs["contested"] == _want_contested, \
+                f"{_nm}: contested {_rs['contested']} != pinned " \
+                f"{_want_contested}"
+        # The sprinkled inertness proof: for every sprinkled variant of a
+        # pre-existing case, the referee's derive() is byte-identical to
+        # the base case's and nothing is retracted or contested.
+        for _base_nm, _spr_nm in SPRINKLE_PAIRS:
+            _b = derive([dict(r) for r in _by_name[_base_nm]["records"]])
+            _s = derive([dict(r) for r in _by_name[_spr_nm]["records"]])
+            assert _s == _b, \
+                f"{_spr_nm}: sprinkled dispute changed derive() vs {_base_nm}"
+            _rs = ref.retraction_status(
+                [dict(r) for r in _by_name[_spr_nm]["records"]])
+            assert _rs["retracted"] == [] and _rs["contested"] == [] and \
+                set(_rs["disputes"].values()) <= {"open"}, \
+                f"{_spr_nm}: sprinkled dispute was not inert: {_rs}"
         # FRONTIER: pin the frozen poc-scale-1 frontier — four members
         # covering 62/62, the root literal recomputed from the construction.
         _scale = [dict(r) for r in _LIVE["poc-scale-1"]]
@@ -1936,11 +2394,19 @@ def main():
         print(f"\nPROPERTY FAILURE: {e}")
         return 1
 
+    total_statuses = sum(
+        len(ref.retraction_status([dict(r) for r in c["records"]])["disputes"])
+        for c in CASES)
+    total_contested = sum(
+        len(ref.retraction_status([dict(r) for r in c["records"]])["contested"])
+        for c in CASES)
     print(f"\nCONFORMANCE: {len(CASES)}/{len(CASES)} cases identical "
           f"(derive + {total_probes} checkpoint probes "
           f"+ {total_witnesses} witness-freshness checks "
           f"+ {total_roots} closure-root digests "
-          f"+ {total_deltas} delta-vs-full derivations); "
+          f"+ {total_deltas} delta-vs-full derivations "
+          f"+ {total_statuses} retraction statuses "
+          f"+ {total_contested} contested markings); "
           f"oracle+invariance {oracle_checks}, transport-pin {pin_checks}, "
           f"live-golden {golden_checks}, poc-quilt-1@task-c root "
           f"{POC_QUILT1_TASK_C_ROOT[:12]}… — all pass")

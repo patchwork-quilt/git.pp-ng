@@ -34,7 +34,7 @@ Everything claimed below is checkable from a cold clone — no Cloudflare accoun
 python3 runner/pp.py state poc-quilt-1
 ```
 
-The harness's last line is the totals line: **863/863 cases identical … — all pass**. (`npm test` runs the same harness.) The runner reads the live demo project and prints the one-line state summary: `config.timeout = 45`.
+The harness's last line is the totals line: **1155/1155 cases identical … — all pass**. (`npm test` runs the same harness.) The runner reads the live demo project and prints the one-line state summary: `config.timeout = 45`.
 
 ## The model (five minutes)
 
@@ -64,6 +64,7 @@ Five concepts, in the order they compose:
 - **Duplicated records** are deduplicated by `id`, first-seen wins. A later copy with the same `id` but different content is dropped and surfaced in `collectionWarnings` on `/api/records` — disagreement is data, not an error to hide (`DESIGN.md` §1).
 - **Records may be born with a digest** (format v2, `docs/FORMAT-V2.md`): one optional `digest` field, a claim about the record's content. **The fold never reads it.** A lying digest degrades its record to v1 with a warning — never a rejection, because a rejection would hand anyone who can flip one byte a lever to make a record vanish.
 - **Checkpoints verify in three verdicts** — VERIFIED, STATE-ONLY, MISMATCH — by re-deriving state and closure root from exactly the checkpoint's named closure. A tamper that touches only a record's `reason`, invisible to derived state, reads STATE-ONLY, never a silent pass (`docs/CHECKPOINT-V2.md`).
+- **Work can be retracted, on the record** — a `dispute` (reason mandatory) names a record whose effects should not stand; a `settlement` rules on it and bites only if its author is the target's author or captain-class (the author of an applied override). An upheld dispute voids the target's effects while the record keeps its graph position. A ratified accusation the author neither filed nor settled is marked **contested**, with the dispute/settlement provenance — never a silent void (`docs/RETRACTION-SPIKE.md`).
 
 ### The honest limits, early
 
@@ -83,7 +84,7 @@ Five concepts, in the order they compose:
 
 Four things in this design surprised even the people building it. Each is stated plainly, with its receipt.
 
-**1. Arrival order is never an input.** The same completions, folded in any order, produce identical state, identical conflicts, identical application order — measured, not asserted. The differential oracle compares the production engine against the legacy engine on all 863 harness cases plus 400 seeded fuzz graphs × 25 permutations: 20,000+ comparisons, zero mismatches (`RESULTS.md` §1.2). The Elixir port was re-fed its log *in reverse arrival order* and produced identical output (§1.6). Two independent judge panels still misread the prose statement of the tie-break as arrival-order-based — the mechanism was innocent, the sentence invited the error — so the seven words above now travel with the rule wherever it is stated (§2.1).
+**1. Arrival order is never an input.** The same completions, folded in any order, produce identical state, identical conflicts, identical application order — measured, not asserted. The differential oracle compares the production engine against the legacy engine on the pre-law harness corpus (863 cases — the retraction-law cases are pinned against the Python referee instead; the frozen legacy engine predates the law) plus 400 seeded fuzz graphs × 25 permutations: 20,000+ comparisons, zero mismatches (`RESULTS.md` §1.2). The Elixir port was re-fed its log *in reverse arrival order* and produced identical output (§1.6). Two independent judge panels still misread the prose statement of the tie-break as arrival-order-based — the mechanism was innocent, the sentence invited the error — so the seven words above now travel with the rule wherever it is stated (§2.1).
 
 **2. Losers are never deleted — and that is load-bearing, not sentimental.** Because losing work is preserved and the state is a pure function of the record, a projection can be destroyed completely and rebuilt from the record alone. The Desk's destroy drill does exactly this: the entire object is destroyed, a fresh instance answers empty, rebuilds — and arrives at the identical state digest *and* the identical closure root (§1.5). Preservation is what makes every other claim in this README checkable by a stranger.
 
@@ -95,7 +96,7 @@ Four things in this design surprised even the people building it. Each is stated
 
 | What | Number | Receipt |
 |---|---|---|
-| Conformance (TS vs Python referee) | 863/863 cases; 1,029 checkpoint probes; 3,231 witness-freshness checks; 16,290 closure-root digests; 16,290 delta-vs-full derivations; 2,812 oracle checks | `conformance/harness.py` |
+| Conformance (TS vs Python referee) | 1155/1155 cases; 1,161 checkpoint probes; 3,649 witness-freshness checks; 19,143 closure-root digests; 19,143 delta-vs-full derivations; 2,812 oracle checks; 302 retraction statuses; 8 contested markings | `conformance/harness.py` |
 | Frontier family | 16/16 cases | `RESULTS.md` §1.4 |
 | Format v2 family | 19/19; 1,758 born-ignored derivations byte-identical; root assembly 16,436 == recomputed | `RESULTS.md` §4 |
 | LEAF-BAND family | 12/12 cases; 29 leaves + 29 roots pinned as literals | `RESULTS.md` §1.7 |

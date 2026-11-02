@@ -10,6 +10,7 @@ import {
   buildFrontierCheckpoint,
   deriveDelta,
   recordLeaf,
+  retractionStatus,
   type FoldRecord,
 } from "../src/fold.ts";
 
@@ -39,6 +40,8 @@ const results = cases.map((c) => ({
     }),
   ),
   freshness: witnessFreshness(c.records),
+  // Retraction: the settlement pass as data, compared Python-vs-TS.
+  retraction: retractionStatus(c.records),
   // checkpoint-v2 record leaf for every record, in case order, compared
   // Python-vs-TS by the harness (the LEAF-BAND family pins these directly;
   // the other families ignore the field).
