@@ -112,6 +112,20 @@ jobs:
           # to restore. An unverifiable cache path would be decoration; the
           # suite runs entirely on the python stdlib and node builtins.
 
+      # `npm test` chains test:worker, which invokes `bun` (package.json).
+      # The runner image has no bun: every run of this job used to pass the
+      # full conformance harness (863/863) and then die at `bun: not found`
+      # (exit 127). Measured from the failed runs' own logs, 2026-11-02.
+      - name: setup bun (test:worker invokes bun)
+        uses: oven-sh/setup-bun@v2
+
+      - name: Assert bun is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v bun >/dev/null || { echo "::error::bun not found; test:worker cannot run"; exit 1; }
+          bun --version
+
       - name: Run the harness exactly as the repository documents it
         shell: bash
         run: |
