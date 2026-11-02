@@ -71,14 +71,14 @@ jobs:
       #                             39107407021.)
       #
       # These are the numbers the harness printed on that run:
-      #   CONFORMANCE: 863/863 cases identical (...)
+      #   CONFORMANCE: 1155/1155 cases identical (...)
       #   FRONTIER:     16/16  cases identical (...)
       #   FORMAT-V2:    19/19  cases identical (...)
       #
       # A count below any of these means the suite shrank, was truncated, or
       # silently stopped running. That is a failure, not a pass.
       # ---------------------------------------------------------------------
-      EXPECTED_CONFORMANCE_CASES: '863'
+      EXPECTED_CONFORMANCE_CASES: '1155'
       EXPECTED_FRONTIER_CASES: '16'
       EXPECTED_FORMATV2_CASES: '19'
 
@@ -114,7 +114,7 @@ jobs:
 
       # `npm test` chains test:worker, which invokes `bun` (package.json).
       # The runner image has no bun: every run of this job used to pass the
-      # full conformance harness (863/863) and then die at `bun: not found`
+      # full conformance harness (1155/1155) and then die at `bun: not found`
       # (exit 127). Measured from the failed runs' own logs, 2026-11-02.
       - name: setup bun (test:worker invokes bun)
         uses: oven-sh/setup-bun@v2
