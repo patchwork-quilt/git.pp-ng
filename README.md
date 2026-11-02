@@ -113,7 +113,7 @@ You do not have to trust any of this. The conformance corpus in `conformance/` i
 
 - **[gitpp-action](https://github.com/patchwork-quilt/gitpp-action)** — this fold as a GitHub Action: derived state as an advisory job summary inside your own CI. Start here if you want the verdict without installing anything.
 - **[gitpp-app](https://github.com/patchwork-quilt/gitpp-app)** — the GitHub App: webhooks in, the derived state back as advisory Checks on pull requests.
-- **[outbound-scanner](https://github.com/patchwork-quilt/outbound-scanner)** — a pre-send fence for agent harnesses: catches session secrets in outbound replies before they ship. Unrelated to the fold; same programme, same honesty rules.
+- **[outbound-scanner](https://github.com/SuperInstance/outbound-scanner)** — a pre-send fence for agent harnesses: catches session secrets in outbound replies before they ship. Unrelated to the fold; same programme, same honesty rules.
 - **[git.pp-desk](https://github.com/patchwork-quilt/git.pp-desk)** — the fold replayed step by step in the browser: step the record, watch state derive, test arrival orders.
 - **[git.pp-grid](https://github.com/patchwork-quilt/git.pp-grid)** — coordination surfaces (custody, on-call) built on the same record idea, for humans.
 - **[gitpp-beam](https://github.com/patchwork-quilt/gitpp-beam)** — the fold re-implemented in Elixir/BEAM from the documents alone; the portability proof and the corpus's third port.
