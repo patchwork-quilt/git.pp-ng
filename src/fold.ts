@@ -1426,11 +1426,15 @@ export function buildCheckpoint(
  * root computed over C by the identical construction.
  *
  * With `frontierIds` omitted, the frontier is computed as the maximal
- * APPLIED records (applied records no other applied record descends from).
- * For that frontier, C is exactly derive's applied set — every applied
- * record is an ancestor-or-self of a maximal applied record, and every
- * ancestor of an applied record is applied — so the pinned state is the
- * full derived state of `records`, not a partial state.
+ * LANDED records (landed records no other landed record descends from;
+ * landed = present and non-orphan, meta records included — a landed
+ * settlement must sit inside the frontier's closure, or the checkpoint
+ * would pin a state that ignores the ruling). For that frontier, C is
+ * exactly the landed set — every landed record is an ancestor-or-self
+ * of a maximal landed record, and every ancestor of a landed record is
+ * landed — so the pinned state is the full derived state of `records`,
+ * not a partial state. (Before the retraction law, landed == applied
+ * and the older "maximal applied" formulation named the same set.)
  *
  * Canonical form: a one-member frontier is emitted in the STRING form, so
  * the result is byte-identical to buildCheckpoint at that record; the array
@@ -1448,17 +1452,22 @@ export function buildFrontierCheckpoint(
   for (const rid of Object.keys(idx)) parents[rid] = parentsOf(idx[rid]);
   let members: string[];
   if (frontierIds === undefined) {
-    const applied = derive(records).order;
-    if (applied.length === 0) return null;
-    const appliedSet = new Set<string>(applied);
-    const hasAppliedChild = new Set<string>();
-    for (const rid of applied) {
+    // Maximal landed records (see the docstring): the member set must
+    // range over meta records too, because a settlement is typically a
+    // leaf — a frontier of maximal APPLIED records would leave a landed
+    // ruling outside every member closure.
+    const prep = prepareDerive(records);
+    if (prep.order.length === 0) return null;
+    const landed = Object.keys(idx).filter((rid) => !prep.orphan.has(rid));
+    const landedSet = new Set<string>(landed);
+    const hasLandedChild = new Set<string>();
+    for (const rid of landed) {
       for (const p of parents[rid]) {
-        if (appliedSet.has(p)) hasAppliedChild.add(p);
+        if (landedSet.has(p)) hasLandedChild.add(p);
       }
     }
-    members = applied
-      .filter((r) => !hasAppliedChild.has(r))
+    members = landed
+      .filter((r) => !hasLandedChild.has(r))
       .sort(cmpCodePoints);
   } else {
     const norm = frontierMembers(frontierIds);

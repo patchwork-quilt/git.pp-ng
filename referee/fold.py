@@ -743,11 +743,15 @@ def build_frontier_checkpoint(records, frontier_ids=None):
     closure root computed over C by the identical construction.
 
     With frontier_ids omitted, the frontier is computed as the maximal
-    APPLIED records (applied records no other applied record descends from).
-    For that frontier, C is exactly derive's applied set — every applied
-    record is an ancestor-or-self of a maximal applied record, and every
-    ancestor of an applied record is applied — so the pinned state is the
-    full derived state of `records`, not a partial state.
+    LANDED records (landed records no other landed record descends from;
+    landed = present and non-orphan, meta records included — a landed
+    settlement must sit inside the frontier's closure, or the checkpoint
+    would pin a state that ignores the ruling). For that frontier, C is
+    exactly the landed set — every landed record is an ancestor-or-self
+    of a maximal landed record, and every ancestor of a landed record is
+    landed — so the pinned state is the full derived state of `records`,
+    not a partial state. (Before the retraction law, landed == applied
+    and the older "maximal applied" formulation named the same set.)
 
     Canonical form: a one-member frontier is emitted in the STRING form, so
     the result is byte-identical to build_checkpoint at that record; the
@@ -758,16 +762,21 @@ def build_frontier_checkpoint(records, frontier_ids=None):
     idx = _index(records)
     parents = {rid: _parents(rec) for rid, rec in idx.items()}
     if frontier_ids is None:
-        applied = derive(records)["order"]
-        if not applied:
+        if not derive(records)["order"]:
             return None
-        applied_set = set(applied)
-        has_applied_child = set()
-        for rid in applied:
+        # Maximal landed records (see the docstring): the member set must
+        # range over meta records too, because a settlement is typically
+        # a leaf — a frontier of maximal APPLIED records would leave a
+        # landed ruling outside every member closure.
+        orphan = _orphan_set(idx, parents)
+        landed = [rid for rid in idx if rid not in orphan]
+        landed_set = set(landed)
+        has_landed_child = set()
+        for rid in landed:
             for p in parents[rid]:
-                if p in applied_set:
-                    has_applied_child.add(p)
-        members = sorted(r for r in applied if r not in has_applied_child)
+                if p in landed_set:
+                    has_landed_child.add(p)
+        members = sorted(r for r in landed if r not in has_landed_child)
     else:
         members = _frontier_members(frontier_ids)
         if members is None:

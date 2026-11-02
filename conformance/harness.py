@@ -1815,8 +1815,8 @@ def main():
         if got.get("deltas") != exp_deltas:
             divergences.append((name, "delta derivation differs across ports"))
         # FRONTIER DERIVATION: the case's AUTO frontier checkpoint (maximal
-        # applied records) must (a) cover exactly the applied set — the
-        # C == applied-set theorem — with the full derived state pinned,
+        # landed records) must (a) cover exactly the landed set — the
+        # C == landed-set theorem — with the full derived state pinned,
         # (b) delta-derive to the FULL derive byte-for-byte, and (c) be
         # built identically by the TS port (members, root, coverage, delta).
         fcp = ref.build_frontier_checkpoint([dict(r) for r in case["records"]])
@@ -1831,9 +1831,12 @@ def main():
                 (name, "frontier checkpoint: referee built one, TS none"))
             return
         frontier_deltas += 1
-        if {r["id"] for r in fcp["closure"]} != set(exp_derive["order"]):
+        _landed = (set(ref._index([ref._canonical_record(r)
+                                   for r in case["records"]]))
+                   - set(exp_derive["orphans"]))
+        if {r["id"] for r in fcp["closure"]} != _landed:
             divergences.append(
-                (name, "frontier covered set != applied set"))
+                (name, "frontier covered set != landed set"))
         if fcp["state"] != exp_derive["state"]:
             divergences.append(
                 (name, "frontier pinned state != full derived state"))
